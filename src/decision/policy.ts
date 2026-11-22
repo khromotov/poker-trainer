@@ -7,8 +7,10 @@ import type {
   Street,
   TournamentStage,
 } from "./engine";
+import { analyzeSizing, chooseSizingAction, gradeSizing } from "./sizing";
+import type { SizingAnalysis, SizingChoice, SizingSample } from "./sizing";
 
-/** An authored teaching policy, NOT an equilibrium solver or a chip-EV predictor.
+/** An authored teaching policy, NOT an equilibrium solver or a full-game EV predictor.
  * The only input boundary is DecisionObservation; no actual opponent cards or
  * undealt cards are accepted. Equity samples hypothetical action-conditioned ranges.
  */
@@ -42,6 +44,8 @@ export interface Analysis {
   survivalAdjusted: boolean;
   effectiveDepth: number;
   shortStackPush: boolean;
+  /** Transient hypothetical sample bank; never part of saved decision feedback. */
+  sizing?: SizingAnalysis;
 }
 export interface Feedback {
   verdict: "good" | "reasonable" | "risky" | "mistake" | "uncertain";
@@ -486,10 +490,16 @@ function equityEstimate(
   equity: number;
   standardError: number;
   expectedShowdownOpponents: number;
+  sizingSamples?: SizingSample[];
 } {
   const opponents = o.players.filter((player) => player.id !== o.actorId);
   const ranges = opponents.map((player) => rangeCdf(o, player));
   const continuation = opponents.map((player) => responderPolicy(o, player));
+  const liveOpponents = opponents
+    .map((player, index) => ({ player, index }))
+    .filter(({ player }) => !player.folded);
+  const sizingSamples: SizingSample[] | undefined =
+    o.street !== "preflop" && liveOpponents.length === 1 ? [] : undefined;
   let sum = 0,
     squared = 0,
     participants = 0;
@@ -518,6 +528,17 @@ function equityEstimate(
       }
     }
     const ownValue = policyHandValue([...o.heroCards, ...board]);
+    if (sizingSamples) {
+      const villainCards = holes[liveOpponents[0].index];
+      const villainValue = policyHandValue([...villainCards, ...board]);
+      sizingSamples.push({
+        villainCards: [...villainCards],
+        // Sizing models the response separately. Do not mix a sampled fold into
+        // this unconditional showdown outcome or count fold equity twice.
+        showdownShare:
+          ownValue > villainValue ? 1 : ownValue === villainValue ? 0.5 : 0,
+      });
+    }
     let ties = 1,
       beaten = false;
     for (let index = 0; index < opponents.length; index++)
@@ -540,6 +561,7 @@ function equityEstimate(
       Math.max(0, squared / samples - equity * equity) / samples,
     ),
     expectedShowdownOpponents: participants / samples,
+    ...(sizingSamples ? { sizingSamples } : {}),
   };
 }
 
@@ -603,6 +625,61 @@ function survivalCaution(
     survivalRisk,
     riskPremium,
     fatalRisk: survivalRisk && toCall >= actor.stack,
+  };
+}
+
+/** Keep the existing authored stage caution when the chip-only sizing tree is
+ * used. This is a teaching preference, not a computed tournament utility. */
+function stageAwareSizingChoice(
+  o: DecisionObservation,
+  sizing: SizingAnalysis,
+  context: Pick<Analysis, "strong" | "marginal" | "survivalAdjusted">,
+): SizingChoice | undefined {
+  const choice = chooseSizingAction(o, sizing);
+  if (!choice || context.strong) return choice;
+  const actor = o.players.find((player) => player.id === o.actorId)!;
+  const costOf = (action: ActionType, total?: number) =>
+    action === "raise" || (action === "all-in" && o.maxRaiseTo > o.currentBet)
+      ? (action === "all-in" ? o.maxRaiseTo : total!) - actor.streetCommitted
+      : action === "call" || action === "all-in"
+        ? Math.min(
+            actor.stack,
+            Math.max(0, o.currentBet - actor.streetCommitted),
+          )
+        : 0;
+  const caution = survivalCaution(
+    o,
+    actor,
+    costOf(choice.action, choice.total),
+  );
+  if (!caution.survivalRisk) return choice;
+  const bankEquity =
+    sizing.samples.reduce((sum, sample) => sum + sample.showdownShare, 0) /
+    Math.max(1, sizing.sampleCount);
+  if (bankEquity >= 0.97) return choice;
+  const aggressive =
+    choice.action === "raise" ||
+    (choice.action === "all-in" && o.maxRaiseTo > o.currentBet);
+  const marginalRisk =
+    context.survivalAdjusted ||
+    context.marginal ||
+    (aggressive && bankEquity < 0.7);
+  if (!marginalRisk) return choice;
+  const raises = raiseCount(o);
+  const safer = sizing.candidates.filter(
+    (candidate) =>
+      candidate.trusted &&
+      (raises < 3 || ["fold", "call", "check"].includes(candidate.action)) &&
+      !survivalCaution(o, actor, costOf(candidate.action, candidate.total))
+        .survivalRisk,
+  );
+  if (!safer.length) return choice;
+  const best = safer.reduce((a, b) => (b.ev > a.ev ? b : a));
+  return {
+    action: best.action,
+    ...(best.total !== undefined ? { total: best.total } : {}),
+    reason:
+      "На поздней стадии выбран более умеренный вклад против покрывающего стека: дорогое продолжение погранично по учебной модели. Это авторская осторожность, а не расчёт ICM или доказательство оптимальной турнирной стратегии.",
   };
 }
 
@@ -682,7 +759,13 @@ export function analyzeDecision(
   const actor = o.players.find((player) => player.id === o.actorId);
   if (!actor || actor.folded || !o.legalActions.length)
     throw Error("Нет доступного решения.");
-  const equity = equityEstimate(o, samples, seeded(options.seed));
+  const { sizingSamples, ...equity } = equityEstimate(
+    o,
+    samples,
+    seeded(options.seed),
+  );
+  const sizing =
+    o.street !== "preflop" ? analyzeSizing(o, sizingSamples ?? []) : undefined;
   const price = callPrice(o),
     f = features(o.heroCards, o.board);
   const active = o.players.filter((player) => !player.folded).length;
@@ -837,6 +920,23 @@ export function analyzeDecision(
       ? o.maxRaiseTo
       : Math.min(o.maxRaiseTo, Math.max(o.minRaiseTo, target));
   }
+  if (sizing?.supported) {
+    const choice = stageAwareSizingChoice(o, sizing, {
+      strong,
+      marginal,
+      survivalAdjusted,
+    });
+    if (choice) {
+      preferred = [choice.action];
+      suggestedRaiseTo =
+        choice.action === "raise"
+          ? choice.total
+          : choice.action === "all-in" && o.maxRaiseTo > o.currentBet
+            ? o.maxRaiseTo
+            : suggestedRaiseTo;
+      reason = choice.reason;
+    }
+  }
   return {
     ...equity,
     ...price,
@@ -855,12 +955,16 @@ export function analyzeDecision(
     survivalAdjusted,
     effectiveDepth,
     shortStackPush,
+    ...(sizing ? { sizing } : {}),
     assumptions: [
+      ...(sizing?.assumptions ?? []),
       "Учебные правила и профили соперников заданы вручную; это не GTO и не расчёт оптимального EV.",
       "Equity на условном вскрытии оценено только по своим картам, открытому борду и публичным действиям. Реальные карты соперников и будущий борд не используются.",
       "Диапазоны — вероятностные предположения, обновляемые по действиям и позициям; конкретные комбинации выбираются с учётом занятых карт.",
       "Не уравнявшие ставку соперники могут сфолдить: участие определяется авторской вероятностью по предполагаемой руке, цене, позиции и стилю. Уже уравнявшие и олл-ин участвуют обязательно; карты сфолдивших остаются удалёнными из колоды.",
-      "Последующие ререйзы и дополнительные вклады не решены как дерево ставок. Возможность фолда ожидающих соперников не является расчётом точной прибыли.",
+      sizing?.supported
+        ? "Для постфлопа один на один сравниваются размеры в ограниченном дереве текущей улицы. Предполагаемые ответы заданы моделью; следующие улицы и полная стратегия не решены."
+        : "Последующие ререйзы и дополнительные вклады не решены как дерево ставок. Возможность фолда ожидающих соперников не является расчётом точной прибыли.",
       "Цена колла учитывает доступные слои банка. На ранних улицах будущие ставки и реализация equity требуют отдельной осторожности.",
       "Стандартная ошибка характеризует только случайную выборку, а не достоверность учебной стратегии.",
       "Поздняя стадия добавляет авторскую осторожность к крупным коллам против покрывающего стека, но не вычисляет ICM: нет выплат и стеков всего турнира. В настоящем хедз-апе эта поправка равна нулю.",
@@ -909,7 +1013,7 @@ export function gradeDecision(
       reason:
         "Повышение должно соответствовать минимальному рейзу и доступному стеку; короткое повышение допустимо только на весь стек.",
     };
-  if (aggressive) {
+  if (aggressive && o.street === "preflop") {
     const target = action === "all-in" ? o.maxRaiseTo : total!;
     const cost =
       target -
@@ -941,6 +1045,39 @@ export function gradeDecision(
         "Здесь есть олл-ин и разные доступные слои банка. Цена колла учитывает ваш доступ к банкам, но общая оценка equity не заменяет отдельный стратегический разбор каждого слоя; уверенно оценивать действие нельзя.",
     };
   const actor = o.players.find((player) => player.id === o.actorId)!;
+  if (o.street !== "preflop") {
+    const sizingFeedback = analysis.sizing?.supported
+      ? gradeSizing(o, analysis.sizing, action, total)
+      : undefined;
+    if (sizingFeedback) {
+      const actionCost = aggressive
+        ? (action === "all-in" ? o.maxRaiseTo : total!) - actor.streetCommitted
+        : normalized === "call"
+          ? analysis.toCall
+          : 0;
+      const caution = survivalCaution(o, actor, actionCost);
+      if (!caution.survivalRisk) return sizingFeedback;
+      const bank = analysis.sizing!.samples;
+      const allSamplesWin =
+        bank.length > 0 && bank.every((sample) => sample.showdownShare === 1);
+      return {
+        ...sizingFeedback,
+        verdict:
+          sizingFeedback.verdict === "good" ||
+          sizingFeedback.verdict === "reasonable"
+            ? allSamplesWin
+              ? "reasonable"
+              : "uncertain"
+            : sizingFeedback.verdict,
+        reason: `${sizingFeedback.reason} На поздней стадии крупный вклад против покрывающего стека дополнительно рискует турнирной жизнью. Модель сравнивает фишки, а не турнирную ценность; без выплат и стеков всего турнира это не расчёт ICM.`,
+      };
+    }
+    return {
+      verdict: "uncertain",
+      title: "Недостаточно данных для уверенной оценки",
+      reason: `${analysis.sizing?.unsupportedReason ?? "Для этой ситуации пока нет сравнения размеров ставок и ответов соперников."} Общая сила комбинации сама по себе не определяет качество конкретной ставки. Это не доказывает ошибку выбранного действия.`,
+    };
+  }
   // A clear shortfall in the chip-price test remains a mistake even late in a
   // tournament. The authored survival premium alone never supplies this verdict.
   if (
@@ -948,7 +1085,7 @@ export function gradeDecision(
     analysis.potOdds !== null &&
     analysis.equity + 2 * analysis.standardError < analysis.potOdds - 0.1 &&
     !analysis.draw &&
-    (o.street === "river" || analysis.toCall >= actor.stack)
+    analysis.toCall >= actor.stack
   )
     return {
       verdict: "mistake",
@@ -996,7 +1133,6 @@ export function gradeDecision(
   if (
     normalized === "call" &&
     !analysis.strong &&
-    o.street !== "river" &&
     analysis.toCall < actor.stack &&
     analysis.preferred.includes("call")
   )
@@ -1075,6 +1211,10 @@ export function chooseBotAction(
 ): BotDecision {
   const analysis =
     suppliedAnalysis ?? analyzeDecision(o, { seed, samples: 240, profile });
+  if (o.street !== "preflop" && analysis.sizing?.supported) {
+    const sized = stageAwareSizingChoice(o, analysis.sizing, analysis);
+    if (sized) return sized;
+  }
   const random = seeded(seed ^ 0x52c73a1b),
     r = random();
   const passive = passiveAction(o),

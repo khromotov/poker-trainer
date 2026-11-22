@@ -13,6 +13,7 @@ import {
   gradeDecision,
   policyHandValue,
 } from "../src/decision/policy";
+import { analyzeSizing } from "../src/decision/sizing";
 
 const card = (rank: number, suit = 0) => (rank - 2) * 4 + suit;
 function context(): DecisionObservation {
@@ -116,6 +117,34 @@ function tournamentLife(): DecisionObservation {
 }
 
 describe("public-information teaching policy", () => {
+  it("keeps authored stage caution when a cached sizing tree favors a marginal full-stack call", () => {
+    const o = tournamentLife();
+    o.street = "flop";
+    o.heroCards = [card(5, 2), card(5, 3)];
+    o.board = [card(12), card(12, 1), card(3, 2)];
+    const sizing = analyzeSizing(
+      o,
+      Array.from({ length: 120 }, (_, index) => ({
+        villainCards: [card(14), card(13, 1)],
+        showdownShare: index < 66 ? 1 : 0,
+      })),
+    );
+    expect(sizing.best?.action).toBe("call");
+    // Exercise the sizing integration with an explicitly marginal cached belief;
+    // range calibration itself is covered independently by the sample-bank tests.
+    const analysis = {
+      ...analyzeDecision(o, { seed: 691, samples: 120 }),
+      sizing,
+      strong: false,
+      marginal: true,
+      survivalAdjusted: true,
+    };
+    expect(chooseBotAction(o, "balanced", 691, analysis).action).toBe("call");
+    const final = { ...o, tournamentStage: "final" as const };
+    const cautious = chooseBotAction(final, "balanced", 691, analysis);
+    expect(cautious.action).toBe("fold");
+    expect(cautious.reason).toContain("не расчёт ICM");
+  });
   it("agrees with the independent core evaluator on complete and partial boards", () => {
     const random = seeded(239);
     for (let trial = 0; trial < 800; trial++) {
@@ -218,6 +247,8 @@ describe("public-information teaching policy", () => {
     o.currentBet = 0;
     o.toCall = 0;
     o.players.forEach((p) => (p.streetCommitted = 0));
+    Object.assign(o.players[0], { stack: 29800, committed: 200 });
+    o.pot = 600;
     o.legalActions = ["check", "raise", "all-in"];
     o.minRaiseTo = 200;
     const a = analyzeDecision(o, { seed: 42, samples: 160 });
@@ -235,17 +266,21 @@ describe("public-information teaching policy", () => {
     o.currentBet = 0;
     o.toCall = 0;
     o.players.forEach((p) => (p.streetCommitted = 0));
+    Object.assign(o.players[0], { stack: 29800, committed: 200 });
+    o.pot = 600;
     o.legalActions = ["check", "raise", "all-in"];
     o.minRaiseTo = 200;
     const a = analyzeDecision(o, { seed: 122, samples: 1000 });
     expect(a.strong).toBe(true);
     expect(a.equity).toBeGreaterThan(0.9);
+    expect(a.sizing?.supported).toBe(true);
     expect(a.preferred).toContain("raise");
-    expect(a.preferred).toContain("check");
     expect(gradeDecision(o, a, "raise", a.suggestedRaiseTo).verdict).toBe(
-      "good",
+      "reasonable",
     );
-    expect(gradeDecision(o, a, "check").verdict).toBe("good");
+    expect(gradeDecision(o, a, "raise", a.suggestedRaiseTo).reason).toContain(
+      "ограниченной модели",
+    );
   });
 
   it("narrows a hypothetical range from public raises rather than knowing the dealt hand", () => {
@@ -289,16 +324,22 @@ describe("public-information teaching policy", () => {
     expect(gradeDecision(o, a, "raise", 399).verdict).toBe("mistake");
   });
 
-  it("does not confuse favorable current odds with proven future profitability", () => {
+  it("separates a favorable current call price from a limited continuation model", () => {
     const o = context();
     o.street = "flop";
     o.heroCards = [card(7), card(7, 1)];
     o.board = [card(14, 2), card(8, 1), card(3, 3)];
     const a = analyzeDecision(o, { seed: 591, samples: 1500 });
-    expect(a.preferred).toContain("call");
     expect(a.strong).toBe(false);
-    expect(gradeDecision(o, a, "call").verdict).toBe("reasonable");
-    expect(gradeDecision(o, a, "call").reason).toContain("дальнейшие ставки");
+    expect(a.sizing?.supported).toBe(true);
+    const call = a.sizing!.candidates.find(
+      (candidate) => candidate.action === "call",
+    )!;
+    expect(call.ev).toBeCloseTo(a.equity * (o.pot + a.toCall) - a.toCall, 8);
+    expect(call.ev).toBeGreaterThan(0);
+    const feedback = gradeDecision(o, a, "call");
+    expect(feedback.reason).toMatch(/[Мм]одел/);
+    expect(feedback.reason).toMatch(/улиц|раздач/);
   });
 
   it("withholds confident grading when multiway side-pot equities need separate treatment", () => {
@@ -483,6 +524,7 @@ describe("public-information teaching policy", () => {
     expect(b.equity).toBe(1);
     expect(b.preferred).toContain("call");
     expect(gradeDecision(nuts, b, "call").verdict).toBe("reasonable");
+    expect(chooseBotAction(nuts, "balanced", 851, b).action).toBe("call");
   });
 
   it("preserves a clear losing chip-price mistake before late-stage caution", () => {

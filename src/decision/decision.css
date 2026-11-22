@@ -238,6 +238,18 @@
 .decision-raise button {
   font-size: 13px;
 }
+.decision-bet-sizes {
+  display: flex;
+  gap: 5px;
+  grid-column: 1 / -1;
+}
+.decision-bet-sizes button {
+  flex: 1;
+  min-width: 0;
+  min-height: 44px;
+  padding: 10px 2px;
+  font-size: 12px;
+}
 .decision-feedback {
   background: var(--surface);
   border: 1px solid var(--border);

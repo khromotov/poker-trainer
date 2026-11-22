@@ -9,7 +9,7 @@ import {
 import type { DecisionObservation, Street, TournamentStage } from "./engine";
 import type { ActionType } from "../table/engine";
 import { gradeDecision } from "./policy";
-import type { Analysis } from "./policy";
+import type { Analysis, Feedback } from "./policy";
 import {
   allArchives,
   completeSession,
@@ -77,6 +77,25 @@ const stageDepths: Record<TournamentStage, { random: string; fixed: string }> =
     },
   };
 const chips = (n: number) => n.toLocaleString("ru-RU");
+function actionName(action: string, currentBet: number) {
+  return action === "raise" && currentBet === 0 ? "Бет" : names[action];
+}
+function logActionName(
+  log: DecisionObservation["history"][number],
+  history: DecisionObservation["history"],
+) {
+  const priorBet =
+    log.street === "preflop" ||
+    history
+      .slice(0, history.indexOf(log))
+      .some(
+        (previous) =>
+          previous.street === log.street &&
+          ["raise", "all-in"].includes(previous.action) &&
+          previous.total > 0,
+      );
+  return actionName(log.action, priorBet ? 1 : 0);
+}
 const defaults: DecisionSettings = {
   playerCount: 10,
   startingStack: 30000,
@@ -156,6 +175,8 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
     [amount, setAmount] = useState(""),
     [retry, setRetry] = useState(0);
   const [showFolded, setShowFolded] = useState(false);
+  const analyzedTurn = useRef(""),
+    cancelRegrade = useRef<(() => void) | null>(null);
   const lock = useRef(false),
     request = useRef(0),
     live = useRef(true);
@@ -179,6 +200,7 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
     return () => {
       active = false;
       live.current = false;
+      cancelRegrade.current?.();
     };
   }, []);
   async function persist(next: DecisionSession) {
@@ -211,6 +233,9 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
     }
   }
   const hand = session?.hand;
+  const turnKey = hand
+    ? `${hand.id}:${hand.logs.length}:${hand.hand.actorId ?? ""}`
+    : "";
   useEffect(() => {
     setAnalysis(null);
     setThinking(false);
@@ -248,7 +273,10 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
         return;
       }
       if (heroTurn) {
-        if (e.data.analysis) setAnalysis(e.data.analysis);
+        if (e.data.analysis) {
+          analyzedTurn.current = turnKey;
+          setAnalysis(e.data.analysis);
+        }
         setThinking(false);
         return;
       }
@@ -336,10 +364,15 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
     ? feedback.observation.history
     : (hand?.logs ?? []);
   const hero = hand?.hand.players.find((p) => p.id === hand.heroId);
-  const ready = heroTurn && !!analysis && !thinking && !pending;
+  const ready =
+    heroTurn &&
+    !!analysis &&
+    analyzedTurn.current === turnKey &&
+    !thinking &&
+    !pending;
   async function choose(action: ActionType, total?: number) {
     await run(async () => {
-      if (!hand || !analysis || !heroTurn) return;
+      if (!hand || !analysis || !ready) return;
       const observation = observe(hand, hand.heroId);
       const feedback = gradeDecision(observation, analysis, action, total);
       const nextHand = applyAction(hand, action, total);
@@ -369,6 +402,64 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
         decisions: [],
         awaitingFeedback: false,
         handNumber: number,
+      });
+    });
+  }
+  async function regrade() {
+    await run(async () => {
+      if (!feedback || !hand) return;
+      const id = `regrade:${++request.current}`;
+      const updated = await new Promise<Feedback>((resolve, reject) => {
+        const worker = new Worker(
+          new URL("./decision.worker.ts", import.meta.url),
+          { type: "module" },
+        );
+        let settled = false;
+        const finish = (value?: Feedback, message?: string) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          worker.terminate();
+          cancelRegrade.current = null;
+          if (value) resolve(value);
+          else reject(Error(message ?? "Не удалось пересчитать оценку."));
+        };
+        const timer = setTimeout(
+          () =>
+            finish(
+              undefined,
+              "Расчёт занял слишком много времени. Попробуйте ещё раз.",
+            ),
+          30000,
+        );
+        cancelRegrade.current = () => finish(undefined, "Расчёт отменён.");
+        worker.onmessage = (event) => {
+          if (event.data.id !== id) return;
+          finish(event.data.feedback, event.data.error);
+        };
+        worker.onerror = () => finish();
+        worker.postMessage({
+          id,
+          mode: "grade",
+          observation: feedback.observation,
+          action: feedback.action,
+          total: feedback.total,
+          seed:
+            (hand.seed ^
+              Math.imul(feedback.observation.history.length + 1, 0x9e3779b9) ^
+              0x5bd1e995) |
+            0,
+          samples: 1800,
+        });
+      });
+      if (!live.current) return;
+      // Re-evaluate only the saved public decision; never replay its action or
+      // consult the cards/actions revealed after it.
+      await persist({
+        ...session!,
+        decisions: session!.decisions.map((record) =>
+          record.id === feedback.id ? { ...record, feedback: updated } : record,
+        ),
       });
     });
   }
@@ -508,7 +599,7 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
                 .map((log, i) => (
                   <span key={i}>
                     {hand.hand.players.find((p) => p.id === log.actorId)?.name}:{" "}
-                    {names[log.action]}
+                    {logActionName(log, visibleLogs)}
                     {log.paid ? ` до ${chips(log.total)}` : ""}
                   </span>
                 ))}
@@ -538,7 +629,7 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
               <div className="feedback-heading">
                 <span>{verdictNames[feedback.feedback.verdict]}</span>
                 <small>
-                  {names[feedback.action]}
+                  {actionName(feedback.action, feedback.observation.currentBet)}
                   {feedback.total ? " до " + chips(feedback.total) : ""}
                 </small>
               </div>
@@ -554,6 +645,13 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
                 }
               >
                 Продолжить раздачу →
+              </button>
+              <button
+                className="text-button"
+                disabled={pending}
+                onClick={() => void regrade()}
+              >
+                {pending ? "Пересчитываем…" : "Пересчитать оценку"}
               </button>
             </div>
           ) : finished ? (
@@ -589,7 +687,7 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
                   <div className="decision-review" key={r.id}>
                     <strong>
                       {i + 1}. {streetNames[r.observation.street]} ·{" "}
-                      {names[r.action]}
+                      {actionName(r.action, r.observation.currentBet)}
                       {r.total ? " до " + chips(r.total) : ""}
                     </strong>
                     <span
@@ -653,7 +751,7 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
                           );
                       }}
                     >
-                      Рейз
+                      {view?.currentBet === 0 ? "Бет" : "Рейз"}
                     </button>
                   </div>
                   {thinking && (
@@ -675,12 +773,40 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
                           }}
                         />
                       </label>
+                      {view.currentBet === 0 && (
+                        <div
+                          className="decision-bet-sizes"
+                          aria-label="Размер ставки от банка"
+                        >
+                          {[25, 33, 50, 75, 100].map((percent) => (
+                            <button
+                              key={percent}
+                              disabled={!ready}
+                              onClick={() =>
+                                setAmount(
+                                  String(
+                                    Math.min(
+                                      view.maxRaiseTo,
+                                      Math.max(
+                                        view.minRaiseTo,
+                                        Math.round((view.pot * percent) / 100),
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              }
+                            >
+                              {percent}%
+                            </button>
+                          ))}
+                        </div>
+                      )}
                       <button
                         disabled={!ready}
                         onClick={() =>
                           void run(async () => {
                             const total = parseChips(amount);
-                            if (!hand || !analysis) return;
+                            if (!hand || !analysis || !ready) return;
                             const obs = observe(hand, hand.heroId),
                               feedback = gradeDecision(
                                 obs,
@@ -729,7 +855,7 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
                 <p>
                   <small>{streetNames[log.street]}</small> ·{" "}
                   {hand.hand.players.find((p) => p.id === log.actorId)?.name}:{" "}
-                  {names[log.action]}
+                  {logActionName(log, visibleLogs)}
                   {log.paid ? ` до ${chips(log.total)}` : ""}
                 </p>
                 {finished &&
@@ -829,6 +955,14 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
               Разбор вашего решения не видит карты соперников и будущий борд. Он
               использует предполагаемые диапазоны, шансы банка и учебные
               правила. Это не GTO и не точный расчёт прибыли.
+            </p>
+            <p>
+              После флопа против одного соперника сравниваются чек, колл и
+              конкретные размеры ставок: возможные фолды, коллы и одно ответное
+              повышение на текущей улице. Учитывается и защита уязвимой руки.
+              Будущие улицы приближённо считаются без новых ставок. Близкие
+              варианты, эффективные повышения больше двух банков после колла и
+              неподдерживаемые ситуации получают неоднозначную оценку.
             </p>
             <p>
               После раздачи можно раскрыть карты и причины ходов ботов. Проигрыш
@@ -1031,7 +1165,8 @@ export function DecisionHistory() {
             {h.decisions.map((r) => (
               <div className="decision-review" key={r.id}>
                 <strong>
-                  {streetNames[r.observation.street]} · {names[r.action]} ·{" "}
+                  {streetNames[r.observation.street]} ·{" "}
+                  {actionName(r.action, r.observation.currentBet)} ·{" "}
                   {verdictNames[r.feedback.verdict]}
                 </strong>
                 <p>{r.feedback.reason}</p>
