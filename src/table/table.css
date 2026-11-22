@@ -341,14 +341,20 @@ summary {
     font-size: 13px;
   }
 }
-.range-cell.uncertain {
-  background-image: repeating-linear-gradient(
-    135deg,
-    transparent,
-    transparent 4px,
-    #ffffff20 4px,
-    #ffffff20 6px
-  );
+.range-cell.action-inconclusive {
+  position: relative;
+  background: #626875;
+  color: #fff;
+}
+.uncertainty-mark {
+  position: absolute;
+  right: 1px;
+  top: 0;
+  font-size: 8px;
+  font-weight: 800;
+}
+.legend-inconclusive:before {
+  background: #626875;
 }
 .seats-details {
   margin: 0;

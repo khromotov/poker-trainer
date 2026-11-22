@@ -23,6 +23,7 @@ import {
 } from "./repository";
 import type { TableSession } from "./repository";
 import { preflopMatrix } from "../strategy/hands";
+import { presentEstimate } from "../strategy/presentation";
 import type { ModelContext, ModelResult } from "../strategy/model";
 import "./table.css";
 
@@ -250,6 +251,7 @@ export function TablePage({ onBack }: { onBack: () => void }) {
     ...hand?.players.find((h) => h.id === p.id),
   }));
   const selectedAdvice = selected ? advice?.hands[selected] : undefined;
+  const selectedEstimate = presentEstimate(selectedAdvice);
   async function openHistory() {
     await operation(async () => {
       setHistory(await allHands());
@@ -502,7 +504,7 @@ export function TablePage({ onBack }: { onBack: () => void }) {
               <div className="matrix-header">
                 <h2>Диапазон</h2>
                 <button onClick={() => setModelOpen(true)}>
-                  Приближённая модель ⓘ
+                  Экспериментальная модель ⓘ
                 </button>
               </div>
               {heroTurn ? (
@@ -523,9 +525,11 @@ export function TablePage({ onBack }: { onBack: () => void }) {
                     <span className="legend-call">Колл / чек</span>
                     <span className="legend-raise">Рейз / 3-бет</span>
                     <span className="legend-jam">Олл-ин</span>
+                    <span className="legend-inconclusive">Нет выбора</span>
                   </div>
                   <p className="matrix-note">
-                    Штриховка — близкие оценки действий
+                    Сравнение внутри модели без будущих ререйзов и ставок. Серый
+                    «?» — действия не удалось различить.
                   </p>
                   <div
                     className="range-grid"
@@ -535,23 +539,35 @@ export function TablePage({ onBack }: { onBack: () => void }) {
                       .flat()
                       .map((h) => {
                         const a = advice?.hands[h];
+                        const shown = presentEstimate(a);
                         return (
                           <button
                             key={h}
                             className={
                               "range-cell action-" +
-                              (a?.action ?? "unknown") +
-                              (a?.uncertain ? " uncertain" : "") +
+                              shown.color +
                               (selected === h ? " picked" : "")
                             }
                             aria-label={
-                              h + (a ? " — " + actionName[a.action] : "")
+                              h +
+                              " — " +
+                              (shown.state === "estimate"
+                                ? "оценка модели: " + actionName[shown.action]
+                                : shown.label)
                             }
                             onClick={() =>
                               setSelected(selected === h ? null : h)
                             }
                           >
                             {h}
+                            {shown.state === "inconclusive" && (
+                              <span
+                                className="uncertainty-mark"
+                                aria-hidden="true"
+                              >
+                                ?
+                              </span>
+                            )}
                           </button>
                         );
                       })}
@@ -560,11 +576,13 @@ export function TablePage({ onBack }: { onBack: () => void }) {
                     <div className="hand-advice">
                       <strong>
                         {selected} ·{" "}
-                        {selectedAdvice
-                          ? actionName[selectedAdvice.action]
-                          : "Считаем…"}
-                        {selectedAdvice?.raiseTo
-                          ? " до " + chips(selectedAdvice.raiseTo)
+                        {selectedEstimate.state === "estimate"
+                          ? "оценка модели: " +
+                            actionName[selectedEstimate.action]
+                          : selectedEstimate.label}
+                        {selectedEstimate.state === "estimate" &&
+                        selectedEstimate.raiseTo
+                          ? " до " + chips(selectedEstimate.raiseTo)
                           : ""}
                       </strong>
                       {selectedAdvice && (
@@ -574,15 +592,15 @@ export function TablePage({ onBack }: { onBack: () => void }) {
                               ([action, ev]) => (
                                 <span key={action}>
                                   {actionName[action]}:{" "}
-                                  {(ev! / displayBB).toFixed(2)} BB
+                                  {(ev! / displayBB).toFixed(1)} BB
                                 </span>
                               ),
                             )}
                           </div>
                           <small>
                             {selectedAdvice.uncertain
-                              ? "Близкие оценки: рекомендация неустойчива."
-                              : "Оценки относительно фолда; будущие ставки не моделируются."}
+                              ? "Выборка не позволяет уверенно выбрать действие. Это не смешанная стратегия."
+                              : "Различие оценок не подтверждает правильность модели. Будущие ререйзы и ставки не учитываются."}
                           </small>
                         </>
                       )}
@@ -743,7 +761,11 @@ export function TablePage({ onBack }: { onBack: () => void }) {
                 ×
               </button>
             </div>
-            <p>Результат упрощённой модели, не GTO и не равновесие.</p>
+            <p>
+              Экспериментальный расчёт, не проверенная покерная стратегия и не
+              GTO. Увеличение выборки снижает шум, но не исправляет
+              предположения модели.
+            </p>
             {(
               advice?.assumptions ?? [
                 "Диапазоны усреднённых оппонентов задаются моделью по позиции и действиям.",
