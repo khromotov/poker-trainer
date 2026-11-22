@@ -49,6 +49,11 @@ const verdictNames: Record<string, string> = {
   mistake: "Ошибка",
   uncertain: "Неоднозначно",
 };
+const profileNames = {
+  balanced: "Умеренный",
+  tight: "Тайтовый",
+  loose: "Лузовый",
+};
 const chips = (n: number) => n.toLocaleString("ru-RU");
 const defaults: DecisionSettings = {
   playerCount: 10,
@@ -433,6 +438,9 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
                       BB
                     </small>
                     <b>{chips(p.stack)}</b>
+                    {p.id !== hand.heroId && (
+                      <small>{profileNames[hand.profiles[p.id]]}</small>
+                    )}
                     <small>
                       {p.folded
                         ? "Фолд"
