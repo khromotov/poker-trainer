@@ -13,6 +13,7 @@ import {
 
 export type { ActionType } from "../table/engine";
 export type Street = "preflop" | "flop" | "turn" | "river";
+export type TournamentStage = "early" | "middle" | "late" | "final";
 export type OpponentProfile = "balanced" | "tight" | "loose";
 export interface TrainingLog {
   street: Street;
@@ -32,6 +33,8 @@ export interface TrainingHand {
   id: string;
   seed: number;
   number: number;
+  /** Optional only for restoring older v1 sessions, where the stage was early. */
+  tournamentStage?: TournamentStage;
   hand: Hand;
   street: Street;
   board: number[];
@@ -60,6 +63,7 @@ export interface PublicPlayer {
 }
 export interface DecisionObservation {
   street: Street;
+  tournamentStage?: TournamentStage;
   board: number[];
   /** Only this observer's cards. The observer can be the hero or a bot. */
   heroCards: number[];
@@ -89,6 +93,7 @@ export interface TrainingOptions {
   bigBlind?: number;
   number?: number;
   randomDepth?: boolean;
+  tournamentStage?: TournamentStage;
 }
 
 const clockwise = <T extends { seat: number }>(players: T[], after: number) =>
@@ -109,19 +114,47 @@ export function createTrainingHand(
   const smallBlind = options.smallBlind ?? 100;
   const bigBlind = options.bigBlind ?? 200;
   const number = options.number ?? 1;
-  const initialPlayers = createPlayers(playerCount, startingStack).map(
-    (player) => ({
-      ...player,
-      name: `Игрок ${player.seat + 1}`,
-      stack: options.randomDepth
+  const tournamentStage = options.tournamentStage ?? "early";
+  if (!["early", "middle", "late", "final"].includes(tournamentStage))
+    throw new Error("Некорректная стадия турнира.");
+  const heroSeat = options.heroSeat ?? 0;
+  const stackForStage = (seat: number): number => {
+    const hero = seat === heroSeat;
+    if (tournamentStage === "early")
+      return options.randomDepth
         ? Math.min(
             startingStack,
             [20, 30, 50, 75, 100, 150][Math.floor(random() * 6)] * bigBlind,
           )
-        : player.stack,
+        : startingStack;
+    if (!options.randomDepth)
+      return (
+        (tournamentStage === "middle"
+          ? 40
+          : tournamentStage === "late"
+            ? 20
+            : 12) * bigBlind
+      );
+    if (tournamentStage === "middle")
+      return [25, 30, 40, 50, 60][Math.floor(random() * 5)] * bigBlind;
+    if (tournamentStage === "late")
+      return (
+        (hero
+          ? 15 + Math.floor(random() * 11)
+          : 10 + Math.floor(random() * 31)) * bigBlind
+      );
+    return (
+      (hero ? 10 + Math.floor(random() * 6) : 8 + Math.floor(random() * 23)) *
+      bigBlind
+    );
+  };
+  const initialPlayers = createPlayers(playerCount, startingStack).map(
+    (player) => ({
+      ...player,
+      name: `Игрок ${player.seat + 1}`,
+      stack: stackForStage(player.seat),
     }),
   );
-  const heroSeat = options.heroSeat ?? 0;
   const hero = initialPlayers.find((player) => player.seat === heroSeat);
   if (!hero) throw new Error("Некорректное место героя.");
   const dealerSeat = options.dealerSeat ?? Math.floor(random() * playerCount);
@@ -154,6 +187,7 @@ export function createTrainingHand(
     id: `decision-${seed}-${number}`,
     seed,
     number,
+    tournamentStage,
     hand,
     street: "preflop",
     board: [],
@@ -237,6 +271,7 @@ export function observe(
   }
   return {
     street: training.street,
+    tournamentStage: training.tournamentStage ?? "early",
     board: [...training.board],
     heroCards: [...training.holeCards[observerId]],
     actorId: observerId,

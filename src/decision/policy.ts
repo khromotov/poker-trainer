@@ -5,6 +5,7 @@ import type {
   OpponentProfile,
   PublicPlayer,
   Street,
+  TournamentStage,
 } from "./engine";
 
 /** An authored teaching policy, NOT an equilibrium solver or a chip-EV predictor.
@@ -18,6 +19,9 @@ export interface Analysis {
   contestablePot: number;
   toCall: number;
   samples: number;
+  /** Players who still owe money and may fold before any showdown. */
+  pendingResponders: number;
+  expectedShowdownOpponents: number;
   allowed: ActionType[];
   preferred: ActionType[];
   suggestedRaiseTo?: number;
@@ -28,6 +32,16 @@ export interface Analysis {
   draw: boolean;
   strong: boolean;
   marginal: boolean;
+  tournamentStage: TournamentStage;
+  /** Authored caution factor, not an ICM-derived equity adjustment. */
+  riskPremium: number;
+  callMargin: number;
+  survivalRisk: boolean;
+  fatalRisk: boolean;
+  stackRiskFraction: number;
+  survivalAdjusted: boolean;
+  effectiveDepth: number;
+  shortStackPush: boolean;
 }
 export interface Feedback {
   verdict: "good" | "reasonable" | "risky" | "mistake" | "uncertain";
@@ -468,11 +482,17 @@ function equityEstimate(
   o: DecisionObservation,
   samples: number,
   random: () => number,
-): { equity: number; standardError: number } {
+): {
+  equity: number;
+  standardError: number;
+  expectedShowdownOpponents: number;
+} {
   const opponents = o.players.filter((player) => player.id !== o.actorId);
   const ranges = opponents.map((player) => rangeCdf(o, player));
+  const continuation = opponents.map((player) => responderPolicy(o, player));
   let sum = 0,
-    squared = 0;
+    squared = 0,
+    participants = 0;
   for (let trial = 0; trial < samples; trial++) {
     const used = new Uint8Array(52);
     for (const card of [...o.heroCards, ...o.board]) used[card] = 1;
@@ -481,6 +501,14 @@ function equityEstimate(
       used[combo.a] = used[combo.b] = 1;
       return [combo.a, combo.b];
     });
+    // Every player's hypothetical cards remain removed even when they fold.
+    // A player behind who still owes the current bet is not a guaranteed caller.
+    const contesting = opponents.map((player, index) => {
+      if (player.folded) return false;
+      if (player.allIn || player.streetCommitted >= o.currentBet) return true;
+      return random() < continuation[index](holes[index]);
+    });
+    participants += contesting.filter(Boolean).length;
     const board = [...o.board];
     while (board.length < 5) {
       const card = Math.floor(random() * 52);
@@ -493,7 +521,7 @@ function equityEstimate(
     let ties = 1,
       beaten = false;
     for (let index = 0; index < opponents.length; index++)
-      if (!opponents[index].folded) {
+      if (contesting[index]) {
         const value = policyHandValue([...holes[index], ...board]);
         if (value > ownValue) {
           beaten = true;
@@ -511,6 +539,7 @@ function equityEstimate(
     standardError: Math.sqrt(
       Math.max(0, squared / samples - equity * equity) / samples,
     ),
+    expectedShowdownOpponents: participants / samples,
   };
 }
 
@@ -539,6 +568,105 @@ function passiveAction(o: DecisionObservation): ActionType {
   return o.toCall > 0 ? "call" : "check";
 }
 
+/** Stage is public context. This is a deliberately authored caution rule, not ICM:
+ * no payouts, other-table stacks or money-equity are available. In true heads-up
+ * no extra premium is applied; two survivors of a larger dealt table are not HU.
+ */
+function survivalCaution(
+  o: DecisionObservation,
+  actor: PublicPlayer,
+  toCall: number,
+) {
+  const tournamentStage = o.tournamentStage ?? "early";
+  const stackRiskFraction = actor.stack > 0 ? toCall / actor.stack : 0;
+  const actorAvailable = actor.stack + actor.committed - actor.antePaid;
+  const covered = o.players.some(
+    (player) =>
+      player.id !== actor.id &&
+      !player.folded &&
+      player.stack + player.committed - player.antePaid >= actorAvailable,
+  );
+  const survivalRisk =
+    tournamentStage !== "early" &&
+    o.players.length > 2 &&
+    covered &&
+    stackRiskFraction > 0.4;
+  const scale = { early: 0, middle: 0.025, late: 0.06, final: 0.1 }[
+    tournamentStage
+  ];
+  const riskPremium = survivalRisk
+    ? scale * clamp((stackRiskFraction - 0.4) / 0.6, 0, 1)
+    : 0;
+  return {
+    tournamentStage,
+    stackRiskFraction,
+    survivalRisk,
+    riskPremium,
+    fatalRisk: survivalRisk && toCall >= actor.stack,
+  };
+}
+
+/** Authored continuation likelihood for a hypothetical pending responder.
+ * It models possible folds, not future raise sizes, optimal play or extra EV.
+ * Calls already paid and all-in hands are handled as certain participants above.
+ */
+function responderPolicy(
+  o: DecisionObservation,
+  player: PublicPlayer,
+): (cards: number[]) => number {
+  const price = callPrice({ ...o, actorId: player.id });
+  const odds = price.potOdds ?? 0;
+  const pressure = price.toCall / Math.max(1, player.stack);
+  const caution = survivalCaution(o, player, price.toCall);
+  const aggression = raiseCount(o);
+  const fraction = clamp(
+    openingFraction(o, player) *
+      (aggression === 0 ? 1.25 : aggression === 1 ? 0.78 : 0.32),
+    0.05,
+    0.65,
+  );
+  const preflopCutoff = clamp(
+    1 -
+      fraction +
+      0.2 * (odds - 0.22) +
+      0.06 * pressure +
+      0.01 * Math.log2(Math.max(1, price.toCall / o.bigBlind)) +
+      0.45 * caution.riskPremium,
+    0.4,
+    0.985,
+  );
+  const postflopCutoff = clamp(
+    0.42 +
+      0.45 * (odds - 0.2) +
+      0.18 * pressure +
+      0.5 * caution.riskPremium +
+      (player.profile === "tight"
+        ? 0.06
+        : player.profile === "loose"
+          ? -0.05
+          : 0),
+    0.25,
+    0.93,
+  );
+  return (cards) => {
+    if (o.street === "preflop") {
+      if (handType(cards) === "AA") return 1;
+      return (
+        0.003 +
+        0.994 * sigmoid((preflopStrength(cards) - preflopCutoff) / 0.035)
+      );
+    }
+    const f = features(cards, o.board);
+    const drawAllowance = f.draw
+      ? (o.street === "flop" ? 0.18 : 0.09) * clamp((0.45 - odds) / 0.25, 0, 1)
+      : 0;
+    return (
+      0.003 +
+      0.994 * sigmoid((f.strength + drawAllowance - postflopCutoff) / 0.08)
+    );
+  };
+}
+
 export function analyzeDecision(
   o: DecisionObservation,
   options: AnalysisOptions,
@@ -558,13 +686,24 @@ export function analyzeDecision(
   const price = callPrice(o),
     f = features(o.heroCards, o.board);
   const active = o.players.filter((player) => !player.folded).length;
+  const pendingResponders = o.players.filter(
+    (player) =>
+      player.id !== o.actorId &&
+      !player.folded &&
+      !player.allIn &&
+      player.streetCommitted < o.currentBet,
+  ).length;
   const aggression = raiseCount(o),
     passive = passiveAction(o),
     aggressive = aggressiveAction(o);
   const ownProfile = options.profile ?? actor.profile;
-  const margin =
+  const baseMargin =
     (o.street === "river" ? 0.02 : 0.055) + Math.max(0, active - 2) * 0.006;
+  const caution = survivalCaution(o, actor, price.toCall);
+  const margin = baseMargin + caution.riskPremium;
   const edge = equity.equity - (price.potOdds ?? 0);
+  const survivalAdjusted =
+    caution.riskPremium > 0 && edge > baseMargin && edge <= margin;
   const marginal =
     price.potOdds !== null &&
     Math.abs(edge - margin) < 2 * equity.standardError + 0.035;
@@ -627,6 +766,54 @@ export function analyzeDecision(
       ? "Есть дро, но текущая цена не даёт достаточного запаса против предполагаемых диапазонов. Имплайд-оддсы здесь не считаются доказанной прибылью."
       : "Цена продолжения высока относительно оценки силы руки против предполагаемых диапазонов. В учебной модели предпочтителен фолд.";
   }
+  const effectiveDepth = o.maxRaiseTo / o.bigBlind;
+  const canPush =
+    o.legalActions.includes("all-in") && o.maxRaiseTo > o.currentBet;
+  const type = handType(o.heroCards),
+    pair = rank(o.heroCards[0]) === rank(o.heroCards[1]);
+  const openPush =
+    preflopOpen &&
+    effectiveDepth <= 15 &&
+    canPush &&
+    preferred.some((action) => action === "raise" || action === "all-in") &&
+    (effectiveDepth <= 12 ||
+      (pair && rank(o.heroCards[0]) <= 11) ||
+      ["AKs", "AKo", "AQs", "AQo", "AJs"].includes(type));
+  const reshoveCutoff = Math.max(
+    0.86,
+    1 - openingFraction(o, { ...actor, profile: ownProfile }) * 0.4,
+  );
+  const reshove =
+    o.street === "preflop" &&
+    aggression > 0 &&
+    aggression <= 2 &&
+    effectiveDepth <= 15 &&
+    canPush &&
+    o.currentBet <= o.maxRaiseTo * 0.45 &&
+    o.players.some(
+      (player) => player.id !== actor.id && !player.folded && !player.allIn,
+    ) &&
+    (f.strong || f.strength >= reshoveCutoff);
+  const shortStackPush = openPush || reshove;
+  if (openPush) {
+    preferred = [
+      "all-in",
+      ...(o.legalActions.includes("raise") ? ["raise" as const] : []),
+    ];
+    reason =
+      "При коротком стеке пуш с подходящей рукой — практичный способ забрать блайнды или получить оплату; небольшое открытие также возможно. Поздняя стадия не требует пассивности: первым повышая, вы сохраняете шанс на фолд соперников.";
+  } else if (reshove) {
+    preferred = [
+      "all-in",
+      ...(strong && edge > margin ? ["call" as const] : []),
+    ];
+    reason =
+      "При коротком стеке эта рука подходит для учебного ререйза олл-ин против обычного открытия. В отличие от колла, пуш может выиграть банк без вскрытия; это предположение о реакции соперника, а не расчёт точного EV.";
+  }
+  if (caution.survivalRisk)
+    reason += caution.fatalRisk
+      ? " На кону турнирная жизнь: на поздней стадии одного преимущества в фишках недостаточно для уверенной оценки колла; это поправка учебных правил, не ICM."
+      : " На поздней стадии против покрывающего стека крупная доплата требует дополнительной осторожности; эта учебная поправка не является ICM.";
   preferred = preferred.filter((action) => o.legalActions.includes(action));
   if (!preferred.length)
     preferred = [
@@ -646,12 +833,15 @@ export function analyzeDecision(
             )
           : o.currentBet * 3
         : o.currentBet + Math.round((o.pot + price.toCall) * 0.66);
-    suggestedRaiseTo = Math.min(o.maxRaiseTo, Math.max(o.minRaiseTo, target));
+    suggestedRaiseTo = shortStackPush
+      ? o.maxRaiseTo
+      : Math.min(o.maxRaiseTo, Math.max(o.minRaiseTo, target));
   }
   return {
     ...equity,
     ...price,
     samples,
+    pendingResponders,
     allowed: [...o.legalActions],
     preferred,
     suggestedRaiseTo,
@@ -660,12 +850,21 @@ export function analyzeDecision(
     draw: f.draw,
     strong,
     marginal,
+    ...caution,
+    callMargin: margin,
+    survivalAdjusted,
+    effectiveDepth,
+    shortStackPush,
     assumptions: [
       "Учебные правила и профили соперников заданы вручную; это не GTO и не расчёт оптимального EV.",
       "Equity на условном вскрытии оценено только по своим картам, открытому борду и публичным действиям. Реальные карты соперников и будущий борд не используются.",
       "Диапазоны — вероятностные предположения, обновляемые по действиям и позициям; конкретные комбинации выбираются с учётом занятых карт.",
+      "Не уравнявшие ставку соперники могут сфолдить: участие определяется авторской вероятностью по предполагаемой руке, цене, позиции и стилю. Уже уравнявшие и олл-ин участвуют обязательно; карты сфолдивших остаются удалёнными из колоды.",
+      "Последующие ререйзы и дополнительные вклады не решены как дерево ставок. Возможность фолда ожидающих соперников не является расчётом точной прибыли.",
       "Цена колла учитывает доступные слои банка. На ранних улицах будущие ставки и реализация equity требуют отдельной осторожности.",
       "Стандартная ошибка характеризует только случайную выборку, а не достоверность учебной стратегии.",
+      "Поздняя стадия добавляет авторскую осторожность к крупным коллам против покрывающего стека, но не вычисляет ICM: нет выплат и стеков всего турнира. В настоящем хедз-апе эта поправка равна нулю.",
+      "С коротким стеком учебная модель допускает открытия пушем и ререйзы олл-ин. Предполагаемое фолд-эквити не является гарантией прибыльности.",
     ],
   };
 }
@@ -741,6 +940,41 @@ export function gradeDecision(
       reason:
         "Здесь есть олл-ин и разные доступные слои банка. Цена колла учитывает ваш доступ к банкам, но общая оценка equity не заменяет отдельный стратегический разбор каждого слоя; уверенно оценивать действие нельзя.",
     };
+  const actor = o.players.find((player) => player.id === o.actorId)!;
+  // A clear shortfall in the chip-price test remains a mistake even late in a
+  // tournament. The authored survival premium alone never supplies this verdict.
+  if (
+    normalized === "call" &&
+    analysis.potOdds !== null &&
+    analysis.equity + 2 * analysis.standardError < analysis.potOdds - 0.1 &&
+    !analysis.draw &&
+    (o.street === "river" || analysis.toCall >= actor.stack)
+  )
+    return {
+      verdict: "mistake",
+      title: "Слишком дорогой колл",
+      reason: `Модель equity даёт ${pct(analysis.equity)}, а для текущего колла требуется ${pct(analysis.potOdds)}. Против предполагаемых диапазонов запас отрицателен даже с учётом шума; в выбранной модели лучше фолд.`,
+    };
+  if (analysis.survivalRisk && normalized === "call")
+    return {
+      verdict:
+        (o.street === "preflop" && handType(o.heroCards) === "AA") ||
+        analysis.equity >= 0.97
+          ? "reasonable"
+          : "uncertain",
+      title: analysis.fatalRisk
+        ? "Колл на турнирную жизнь"
+        : "Крупный колл на поздней стадии",
+      reason:
+        "Текущая цена в фишках сама по себе не доказывает разумность риска: покрывающий стек может лишить вас большой части стека или выбить. Точная турнирная ценность не рассчитана, поэтому учебная поправка не превращает такой колл в доказанную ошибку.",
+    };
+  if (analysis.survivalAdjusted && normalized === "fold")
+    return {
+      verdict: "reasonable",
+      title: "Осторожный турнирный фолд",
+      reason:
+        "По цене в фишках продолжение возможно, но учебные правила учитывают риск крупной потери против покрывающего стека. Без выплат и стеков всего турнира нельзя утверждать, что этот фолд оптимален по ICM.",
+    };
   if (analysis.marginal && !analysis.strong && normalized !== "check")
     return {
       verdict: "uncertain",
@@ -748,7 +982,17 @@ export function gradeDecision(
       reason:
         "Оценка близка к границе продолжения; шум выборки и предположения о диапазонах могут изменить вывод. Уверенно объявлять это ошибкой нельзя.",
     };
-  const actor = o.players.find((player) => player.id === o.actorId)!;
+  if (
+    normalized === "call" &&
+    analysis.pendingResponders > 0 &&
+    !analysis.strong
+  )
+    return {
+      verdict: "reasonable",
+      title: "Колл с учётом игроков позади",
+      reason:
+        "Игроки, ещё не уравнявшие ставку, могут сбросить: оценка не считает их обязательными участниками вскрытия. Но они также могут коллировать или повысить; дальнейшее дерево ставок не рассчитано, поэтому прибыльность не доказана.",
+    };
   if (
     normalized === "call" &&
     !analysis.strong &&
@@ -800,18 +1044,6 @@ export function gradeDecision(
           ? "У руки есть шансы усилиться, поэтому полублеф возможен. Он требует, чтобы соперники иногда сбрасывали; одной вероятности усиления недостаточно."
           : "Сильная рука может повышать на добор. Это не означает, что рейз лучше колла против любого диапазона.",
     };
-  if (
-    normalized === "call" &&
-    analysis.potOdds !== null &&
-    analysis.equity + 2 * analysis.standardError < analysis.potOdds - 0.1 &&
-    !analysis.draw &&
-    (o.street === "river" || analysis.toCall >= actor.stack)
-  )
-    return {
-      verdict: "mistake",
-      title: "Слишком дорогой колл",
-      reason: `Модель equity даёт ${pct(analysis.equity)}, а для текущего колла требуется ${pct(analysis.potOdds)}. Против предполагаемых диапазонов запас отрицателен даже с учётом шума; в выбранной модели лучше фолд.`,
-    };
   if (normalized === "fold" && analysis.strong)
     return {
       verdict: "risky",
@@ -851,11 +1083,18 @@ export function chooseBotAction(
     headsUp = o.players.filter((player) => !player.folded).length === 2;
   let action = analysis.preferred[0];
   // Three raises per street bound the bot tree; the engine still validates every move.
-  if (aggressive && raises < 3 && analysis.preferred.includes(aggressive))
+  if (
+    analysis.shortStackPush &&
+    raises < 3 &&
+    o.legalActions.includes("all-in")
+  )
+    action = "all-in";
+  else if (aggressive && raises < 3 && analysis.preferred.includes(aggressive))
     action = r < (profile === "loose" ? 0.83 : 0.72) ? aggressive : passive;
   else if (action === "fold") {
     const continueChance =
-      profile === "loose" ? 0.15 : profile === "tight" ? 0.025 : 0.07;
+      (profile === "loose" ? 0.15 : profile === "tight" ? 0.025 : 0.07) *
+      (1 - 0.85 * clamp(analysis.riskPremium / 0.1, 0, 1));
     if (
       r < continueChance &&
       (analysis.marginal || analysis.draw || analysis.strength > 0.65)
@@ -888,16 +1127,19 @@ export function chooseBotAction(
     action === "raise" || (action === "all-in" && o.maxRaiseTo > o.currentBet);
   let reason: string;
   if (isRaise)
-    reason = analysis.strong
-      ? "Повышение на добор с сильной рукой против предполагаемого диапазона."
-      : analysis.draw
-        ? "Полублеф: есть возможность усилиться и забрать банк фолдом соперника."
-        : analysis.preferred.includes(action)
-          ? "Рука входит в учебный диапазон повышения для этой позиции."
-          : "Редкий блеф по вероятностной политике; успех не гарантирован.";
+    reason = analysis.shortStackPush
+      ? "Пуш с коротким стеком: подходящая рука и возможность забрать банк фолдом соперников; поздняя стадия не требует обязательной пассивности."
+      : analysis.strong
+        ? "Повышение на добор с сильной рукой против предполагаемого диапазона."
+        : analysis.draw
+          ? "Полублеф: есть возможность усилиться и забрать банк фолдом соперника."
+          : analysis.preferred.includes(action)
+            ? "Рука входит в учебный диапазон повышения для этой позиции."
+            : "Редкий блеф по вероятностной политике; успех не гарантирован.";
   else if (action === "fold")
-    reason =
-      "Цена продолжения или позиция не подходят силе руки по учебной модели.";
+    reason = analysis.survivalRisk
+      ? "Осторожный фолд на поздней стадии: крупный колл против покрывающего стека требует большего запаса, чем одна цена банка. Это учебное правило, не точный ICM."
+      : "Цена продолжения или позиция не подходят силе руки по учебной модели.";
   else if (action === "check")
     reason = analysis.strong
       ? "Чек с сильной рукой сохраняет слабые руки соперника в раздаче."

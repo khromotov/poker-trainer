@@ -6,7 +6,7 @@ import {
   observe,
   positionLabel,
 } from "./engine";
-import type { DecisionObservation, Street } from "./engine";
+import type { DecisionObservation, Street, TournamentStage } from "./engine";
 import type { ActionType } from "../table/engine";
 import { gradeDecision } from "./policy";
 import type { Analysis } from "./policy";
@@ -54,6 +54,28 @@ const profileNames = {
   tight: "Тайтовый",
   loose: "Лузовый",
 };
+const stageNames: Record<TournamentStage, string> = {
+  early: "Ранняя стадия",
+  middle: "Середина турнира",
+  late: "Поздняя стадия",
+  final: "Финальный стол",
+};
+const stageDepths: Record<TournamentStage, { random: string; fixed: string }> =
+  {
+    early: {
+      random: "Случайная глубина до 150 BB, не выше стартового стека.",
+      fixed: "Все игроки получают указанный стартовый стек.",
+    },
+    middle: { random: "Стеки 25–60 BB.", fixed: "Стеки 40 BB." },
+    late: {
+      random: "Ваш стек 15–25 BB, у соперников 10–40 BB.",
+      fixed: "Стеки 20 BB.",
+    },
+    final: {
+      random: "Ваш стек 10–15 BB, у соперников 8–30 BB.",
+      fixed: "Стеки 12 BB.",
+    },
+  };
 const chips = (n: number) => n.toLocaleString("ru-RU");
 const defaults: DecisionSettings = {
   playerCount: 10,
@@ -61,6 +83,7 @@ const defaults: DecisionSettings = {
   smallBlind: 100,
   bigBlind: 200,
   randomDepth: true,
+  tournamentStage: "early",
 };
 const fresh = (): DecisionSession => ({
   version: 1,
@@ -406,6 +429,12 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
               ante
             </span>
           </div>
+          <div className="decision-stage">
+            <span>{stageNames[hand.tournamentStage ?? "early"]}</span>
+            {hand.tournamentStage && hand.tournamentStage !== "early" && (
+              <span>Без реэнтри</span>
+            )}
+          </div>
           <details className="decision-seats" open>
             <summary>
               Стол · {hand.hand.players.length} игроков
@@ -530,6 +559,13 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
           ) : finished ? (
             <div className="decision-finish">
               <h2>Раздача завершена</h2>
+              {hero?.stack === 0 &&
+                hand.tournamentStage &&
+                hand.tournamentStage !== "early" && (
+                  <p className="error">
+                    Вылет. В этом сценарии реэнтри закрыто.
+                  </p>
+                )}
               <p>
                 {hero
                   ? `Ваш результат: ${hero.stack - hero.startStack >= 0 ? "+" : ""}${chips(hero.stack - hero.startStack)} фишек`
@@ -727,6 +763,20 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
               setSettingsOpen(false);
             })
           }
+          onStart={(value) =>
+            void run(async () => {
+              const number = session.handNumber + 1;
+              await persist({
+                ...session,
+                settings: value,
+                handNumber: number,
+                hand: newHand(value, number),
+                decisions: [],
+                awaitingFeedback: false,
+              });
+              setSettingsOpen(false);
+            })
+          }
           pending={pending}
           error={error}
         />
@@ -784,6 +834,12 @@ export function DecisionTrainer({ onBack }: { onBack: () => void }) {
               После раздачи можно раскрыть карты и причины ходов ботов. Проигрыш
               не означает ошибку, а выигрыш — правильное решение.
             </p>
+            <p>
+              Стадия турнира задаёт глубину стеков и учебную поправку на риск
+              вылета. В поздних стадиях колл против покрывающего стека требует
+              дополнительной осторожности. Это приближение без расчёта выплат и
+              точного ICM; короткий стек по-прежнему может играть агрессивно.
+            </p>
           </div>
         </div>
       )}
@@ -795,18 +851,35 @@ function DecisionSettingsPanel({
   settings,
   onClose,
   onSave,
+  onStart,
   pending,
   error,
 }: {
   settings: DecisionSettings;
   onClose: () => void;
   onSave: (s: DecisionSettings) => void;
+  onStart: (s: DecisionSettings) => void;
   pending: boolean;
   error: string;
 }) {
   const [count, setCount] = useState(settings.playerCount),
     [stack, setStack] = useState(String(settings.startingStack)),
-    [random, setRandom] = useState(settings.randomDepth);
+    [random, setRandom] = useState(settings.randomDepth),
+    [stage, setStage] = useState<TournamentStage>(
+      settings.tournamentStage ?? "early",
+    );
+  const validStack =
+    /^\d+$/.test(stack) &&
+    Number(stack) >= 1000 &&
+    Number.isSafeInteger(Number(stack));
+  const draft: DecisionSettings = {
+    ...settings,
+    tournamentStage: stage,
+    playerCount: count,
+    startingStack: validStack ? Number(stack) : settings.startingStack,
+    randomDepth: random,
+  };
+  const disabled = pending || (stage === "early" && !validStack);
   return (
     <div className="overlay" onClick={onClose}>
       <div
@@ -825,6 +898,18 @@ function DecisionSettingsPanel({
         {error && <p className="error">{error}</p>}
         <div className="decision-settings">
           <label>
+            Стадия турнира
+            <select
+              value={stage}
+              onChange={(e) => setStage(e.target.value as TournamentStage)}
+            >
+              <option value="early">Ранняя стадия</option>
+              <option value="middle">Середина · 25–60 BB</option>
+              <option value="late">Поздняя · 15–25 BB</option>
+              <option value="final">Финальный стол · 10–15 BB</option>
+            </select>
+          </label>
+          <label>
             Игроков
             <select
               value={count}
@@ -837,14 +922,16 @@ function DecisionSettingsPanel({
               ))}
             </select>
           </label>
-          <label>
-            Стартовый стек
-            <input
-              inputMode="numeric"
-              value={stack}
-              onChange={(e) => setStack(e.target.value)}
-            />
-          </label>
+          {stage === "early" && (
+            <label>
+              Стартовый стек
+              <input
+                inputMode="numeric"
+                value={stack}
+                onChange={(e) => setStack(e.target.value)}
+              />
+            </label>
+          )}
           <label className="decision-switch">
             <input
               type="checkbox"
@@ -854,28 +941,29 @@ function DecisionSettingsPanel({
             Случайная глубина стеков
           </label>
           <p className="hint">
+            {stageDepths[stage][random ? "random" : "fixed"]} Глубина до
+            блайндов и анте.
+            {stage !== "early" &&
+              " Без реэнтри. Учёт риска вылета приближённый, без точного ICM."}
+          </p>
+          <p className="hint">
             Настройки применяются к следующей раздаче. Блайнды 100/200, BB ante
             200.
           </p>
           <button
             className="primary"
-            disabled={
-              pending ||
-              !/^\d+$/.test(stack) ||
-              Number(stack) < 1000 ||
-              !Number.isSafeInteger(Number(stack))
-            }
-            onClick={() =>
-              onSave({
-                ...settings,
-                playerCount: count,
-                startingStack: Number(stack),
-                randomDepth: random,
-              })
-            }
+            disabled={disabled}
+            onClick={() => onSave(draft)}
           >
             Сохранить
           </button>
+          <button disabled={disabled} onClick={() => onStart(draft)}>
+            Сохранить и начать новую раздачу
+          </button>
+          <p className="hint">
+            Новая раздача заменит текущую. Незавершённая раздача не попадёт в
+            историю.
+          </p>
         </div>
       </div>
     </div>
@@ -924,8 +1012,8 @@ export function DecisionHistory() {
         .map((h) => (
           <details key={h.id}>
             <summary>
-              #{h.hand.number} ·{" "}
-              {new Date(h.timestamp).toLocaleDateString("ru-RU")} ·{" "}
+              #{h.hand.number} · {stageNames[h.hand.tournamentStage ?? "early"]}{" "}
+              · {new Date(h.timestamp).toLocaleDateString("ru-RU")} ·{" "}
               {h.decisions.length} решений
             </summary>
             <div className="archived-cards">

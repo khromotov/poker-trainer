@@ -4,6 +4,7 @@ import {
   applyAction,
   createTrainingHand,
   observe,
+  type TournamentStage,
   type TrainingHand,
 } from "../src/decision/engine";
 import { pot, startHand } from "../src/table/engine";
@@ -55,6 +56,139 @@ function fixedRunout(training: TrainingHand, board: number[]) {
 }
 
 describe("decision trainer complete hand engine", () => {
+  it("keeps early-stage stacks and default stage backwards compatible", () => {
+    const implicit = createTrainingHand(742, {
+      playerCount: 10,
+      randomDepth: true,
+    });
+    const explicit = createTrainingHand(742, {
+      playerCount: 10,
+      randomDepth: true,
+      tournamentStage: "early",
+    });
+    expect(implicit).toEqual(explicit);
+    expect(implicit.tournamentStage).toBe("early");
+    expect(observe(implicit, implicit.heroId).tournamentStage).toBe("early");
+    const legacy = structuredClone(implicit);
+    delete legacy.tournamentStage;
+    expect(observe(legacy, legacy.heroId).tournamentStage).toBe("early");
+    expect(
+      createTrainingHand(342, {
+        tournamentStage: "early",
+        startingStack: 7300,
+      }).initialPlayers.every((player) => player.stack === 7300),
+    ).toBe(true);
+    expect(
+      createTrainingHand(342, {
+        tournamentStage: "early",
+        startingStack: 3000,
+        randomDepth: true,
+      }).initialPlayers.every((player) => player.stack === 3000),
+    ).toBe(true);
+  });
+
+  it("assigns the fixed depth of each later stage independently of the initial tournament stack", () => {
+    const fixed = { middle: 40, late: 20, final: 12 } as const;
+    for (const stage of ["middle", "late", "final"] as const) {
+      const hand = createTrainingHand(931, {
+        playerCount: 10,
+        startingStack: 1000,
+        tournamentStage: stage,
+      });
+      expect(
+        hand.initialPlayers.every(
+          (player) => player.stack === fixed[stage] * 200,
+        ),
+      ).toBe(true);
+      expect(hand.tournamentStage).toBe(stage);
+      expect(observe(hand, hand.heroId).tournamentStage).toBe(stage);
+      expect(passiveToEnd(hand).tournamentStage).toBe(stage);
+    }
+  });
+
+  it("generates deterministic whole-BB stage stacks with distinct hero and opponent bounds", () => {
+    const seen = new Map<TournamentStage, Set<number>>();
+    for (const stage of ["middle", "late", "final"] as const) {
+      seen.set(stage, new Set());
+      for (let seed = 0; seed < 80; seed++) {
+        const options = {
+          playerCount: 10,
+          heroSeat: 7,
+          startingStack: 1000,
+          smallBlind: 250,
+          bigBlind: 500,
+          tournamentStage: stage,
+          randomDepth: true,
+        };
+        const hand = createTrainingHand(seed, options);
+        expect(hand).toEqual(createTrainingHand(seed, options));
+        expect(hand.tournamentStage).toBe(stage);
+        for (const player of hand.initialPlayers) {
+          const bb = player.stack / 500;
+          expect(Number.isInteger(bb)).toBe(true);
+          const isHero = player.id === hand.heroId;
+          if (stage === "middle") expect([25, 30, 40, 50, 60]).toContain(bb);
+          else if (stage === "late") {
+            expect(bb).toBeGreaterThanOrEqual(isHero ? 15 : 10);
+            expect(bb).toBeLessThanOrEqual(isHero ? 25 : 40);
+          } else {
+            expect(bb).toBeGreaterThanOrEqual(isHero ? 10 : 8);
+            expect(bb).toBeLessThanOrEqual(isHero ? 15 : 30);
+          }
+          seen.get(stage)!.add(bb);
+        }
+        const cards = [...Object.values(hand.holeCards).flat(), ...hand.deck];
+        expect(new Set(cards).size).toBe(52);
+      }
+    }
+    expect(seen.get("middle")!.size).toBe(5);
+    expect(seen.get("late")!.size).toBeGreaterThan(20);
+    expect(seen.get("final")!.size).toBeGreaterThan(15);
+  });
+
+  it("conserves all short final-stage stacks without reentry or replenishing a busted player", () => {
+    for (let seed = 0; seed < 40; seed++) {
+      let hand = createTrainingHand(seed, {
+        playerCount: 10,
+        tournamentStage: "final",
+        randomDepth: true,
+      });
+      const originalStage = hand.tournamentStage;
+      const initialTotal = hand.initialPlayers.reduce(
+        (sum, player) => sum + player.stack,
+        0,
+      );
+      while (hand.phase === "playing") {
+        const observation = observe(hand, hand.hand.actorId!);
+        hand = applyAction(
+          hand,
+          observation.legalActions.includes("all-in")
+            ? "all-in"
+            : observation.toCall
+              ? "call"
+              : "check",
+        );
+      }
+      expect(hand.tournamentStage).toBe(originalStage);
+      expect(
+        hand.hand.players.reduce((sum, player) => sum + player.stack, 0),
+      ).toBe(initialTotal);
+      expect(hand.hand.players.some((player) => player.stack === 0)).toBe(true);
+      for (const player of hand.hand.players) {
+        const payout = hand.results!.find(
+          (result) => result.playerId === player.id,
+        )!.payout;
+        expect(player.stack).toBe(
+          player.startStack - player.committed + payout,
+        );
+      }
+      expect(hand.results!.reduce((sum, result) => sum + result.net, 0)).toBe(
+        0,
+      );
+      expect(observe(hand, hand.heroId).tournamentStage).toBe("final");
+    }
+  });
+
   it("deals all private cards before play, deterministically with a fixed unique runout", () => {
     const first = createTrainingHand(742, {
       playerCount: 10,

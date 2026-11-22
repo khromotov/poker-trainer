@@ -1,5 +1,9 @@
 import type { ActionType } from "../table/engine";
-import type { TrainingHand, DecisionObservation } from "./engine";
+import type {
+  TrainingHand,
+  DecisionObservation,
+  TournamentStage,
+} from "./engine";
 import type { Feedback } from "./policy";
 
 export interface DecisionSettings {
@@ -8,6 +12,8 @@ export interface DecisionSettings {
   smallBlind: number;
   bigBlind: number;
   randomDepth: boolean;
+  /** Missing in old v1 data; interpreted as early without rewriting history. */
+  tournamentStage?: TournamentStage;
 }
 
 export interface DecisionRecord {
@@ -50,6 +56,7 @@ const MAX_IMPORT_LENGTH = 10 * 1024 * 1024;
 const ACTIONS = ["fold", "check", "call", "raise", "all-in"];
 const POSTINGS = [...ACTIONS, "ante", "small-blind", "big-blind"];
 const STREETS = ["preflop", "flop", "turn", "river"];
+const TOURNAMENT_STAGES = ["early", "middle", "late", "final"];
 
 function invalid(message = "Неверная структура данных тренажёра"): never {
   throw Error(message);
@@ -287,6 +294,8 @@ function validateSettings(value: unknown): DecisionSettings {
   integer(settings.bigBlind, 1);
   if (settings.smallBlind > settings.bigBlind) invalid("Неверные блайнды");
   boolean(settings.randomDepth);
+  if (settings.tournamentStage !== undefined)
+    enumeration(settings.tournamentStage, TOURNAMENT_STAGES);
   safeSum(Array(settings.playerCount).fill(settings.startingStack));
   return {
     playerCount: settings.playerCount,
@@ -294,6 +303,9 @@ function validateSettings(value: unknown): DecisionSettings {
     smallBlind: settings.smallBlind,
     bigBlind: settings.bigBlind,
     randomDepth: settings.randomDepth,
+    ...(settings.tournamentStage === undefined
+      ? {}
+      : { tournamentStage: settings.tournamentStage as TournamentStage }),
   };
 }
 
@@ -469,6 +481,8 @@ function validateChipHand(value: unknown): {
 
 function validateTrainingHand(value: unknown): TrainingHand {
   const training = object(value);
+  if (training.tournamentStage !== undefined)
+    enumeration(training.tournamentStage, TOURNAMENT_STAGES);
   text(training.id);
   integer(training.seed, -Number.MAX_SAFE_INTEGER);
   integer(training.number, 1);
@@ -629,6 +643,13 @@ function validateObservation(
 ): DecisionObservation {
   const observation = object(value);
   if (!training) invalid("Решение без раздачи");
+  if (observation.tournamentStage !== undefined)
+    enumeration(observation.tournamentStage, TOURNAMENT_STAGES);
+  if (
+    (observation.tournamentStage ?? "early") !==
+    (training.tournamentStage ?? "early")
+  )
+    invalid("Стадия решения не совпадает с раздачей");
   enumeration(observation.street, STREETS);
   text(observation.actorId);
   if (observation.actorId !== training.heroId)
@@ -779,6 +800,9 @@ function validateObservation(
     invalid("Неверные доступные действия");
   return {
     street: observation.street as DecisionObservation["street"],
+    ...(observation.tournamentStage === undefined
+      ? {}
+      : { tournamentStage: observation.tournamentStage as TournamentStage }),
     board,
     heroCards,
     actorId: observation.actorId,

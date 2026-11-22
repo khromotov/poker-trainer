@@ -5,6 +5,7 @@ import {
   createTrainingHand,
   observe,
   type TrainingHand,
+  type TournamentStage,
 } from "../src/decision/engine";
 import {
   allArchives,
@@ -33,16 +34,23 @@ const settings = {
   randomDepth: false,
 };
 
-function session(seed = 100): DecisionSession {
+function session(
+  seed = 100,
+  tournamentStage?: TournamentStage,
+): DecisionSession {
+  const currentSettings = {
+    ...settings,
+    ...(tournamentStage === undefined ? {} : { tournamentStage }),
+  };
   return {
     version: 1,
     id: `session-${seed}`,
-    settings: { ...settings },
+    settings: currentSettings,
     handNumber: 1,
     decisions: [],
     awaitingFeedback: false,
     hand: createTrainingHand(seed, {
-      ...settings,
+      ...currentSettings,
       heroSeat: 0,
       dealerSeat: 0,
       number: 1,
@@ -50,8 +58,8 @@ function session(seed = 100): DecisionSession {
   };
 }
 
-function heroDecision(): DecisionSession {
-  const current = session();
+function heroDecision(tournamentStage?: TournamentStage): DecisionSession {
+  const current = session(100, tournamentStage);
   const observation = observe(current.hand!, current.hand!.heroId);
   expect(observation.actorId).toBe(current.hand!.hand.actorId);
   const action = observation.legalActions.includes("call") ? "call" : "check";
@@ -71,8 +79,11 @@ function heroDecision(): DecisionSession {
   return current;
 }
 
-function finished(): { current: DecisionSession; archive: Archive } {
-  const current = heroDecision();
+function finished(tournamentStage?: TournamentStage): {
+  current: DecisionSession;
+  archive: Archive;
+} {
+  const current = heroDecision(tournamentStage);
   let hand = current.hand!;
   for (let count = 0; hand.phase === "playing"; count += 1) {
     if (count > 1000) throw Error("Hand did not finish");
@@ -101,6 +112,116 @@ function finished(): { current: DecisionSession; archive: Archive } {
 beforeEach(() => {
   globalThis.indexedDB = new IDBFactory();
   vi.restoreAllMocks();
+});
+
+describe("tournament stage persistence", () => {
+  it.each(["early", "middle", "late", "final"] as const)(
+    "round-trips %s settings, hand and pre-action observation without a schema change",
+    async (stage) => {
+      const { current, archive } = finished(stage);
+      expect(current.settings.tournamentStage).toBe(stage);
+      expect(current.hand!.tournamentStage).toBe(stage);
+      expect(current.decisions[0].observation.tournamentStage).toBe(stage);
+      await saveSession(current);
+      expect(await loadSession()).toEqual(current);
+      const payload = parseHistoryImport(exportHistory([archive]));
+      expect(payload.version).toBe(1);
+      expect(payload.history[0]).toEqual(archive);
+      expect(await importHistory(payload)).toEqual({ added: 1, skipped: 0 });
+      expect(await allArchives()).toEqual([archive]);
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open("poker-decisions");
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+      expect(database.version).toBe(1);
+      database.close();
+    },
+  );
+
+  it("accepts old v1 data with every stage absent and preserves the historical shape", async () => {
+    const { current, archive } = finished();
+    delete current.settings.tournamentStage;
+    delete current.hand!.tournamentStage;
+    delete archive.hand.tournamentStage;
+    current.decisions.forEach((decision) => {
+      delete decision.observation.tournamentStage;
+    });
+    archive.decisions.forEach((decision) => {
+      delete decision.observation.tournamentStage;
+    });
+    await saveSession(current);
+    const restored = (await loadSession())!;
+    expect(restored).toEqual(current);
+    expect(restored.settings).not.toHaveProperty("tournamentStage");
+    expect(restored.hand).not.toHaveProperty("tournamentStage");
+    expect(restored.decisions[0].observation).not.toHaveProperty(
+      "tournamentStage",
+    );
+    const payload = parseHistoryImport(exportHistory([archive]));
+    expect(payload.history[0].hand).not.toHaveProperty("tournamentStage");
+    expect(payload.history[0].decisions[0].observation).not.toHaveProperty(
+      "tournamentStage",
+    );
+    await importHistory(payload);
+    expect(await allArchives()).toEqual([archive]);
+    expect(await loadSession()).toEqual(current);
+  });
+
+  it("accepts an explicit early observation appended to a legacy deal", async () => {
+    const current = heroDecision("early");
+    delete current.settings.tournamentStage;
+    delete current.hand!.tournamentStage;
+    await saveSession(current);
+    const restored = (await loadSession())!;
+    expect(restored.hand).not.toHaveProperty("tournamentStage");
+    expect(restored.decisions[0].observation.tournamentStage).toBe("early");
+  });
+
+  it("keeps the current hand stage distinct from next-deal settings", async () => {
+    const current = heroDecision("middle");
+    current.settings.tournamentStage = "final";
+    await saveSession(current);
+    const restored = (await loadSession())!;
+    expect(restored.settings.tournamentStage).toBe("final");
+    expect(restored.hand!.tournamentStage).toBe("middle");
+    expect(restored.decisions[0].observation.tournamentStage).toBe("middle");
+  });
+
+  it.each(["settings", "hand", "observation"] as const)(
+    "rejects an unknown %s stage before any write",
+    async (field) => {
+      const current = heroDecision("middle");
+      await saveSession(current);
+      const bad = structuredClone(current);
+      const target =
+        field === "settings"
+          ? bad.settings
+          : field === "hand"
+            ? bad.hand!
+            : bad.decisions[0].observation;
+      (target as { tournamentStage?: string }).tournamentStage = "bubble";
+      await expect(saveSession(bad)).rejects.toThrow();
+      expect(await loadSession()).toEqual(current);
+    },
+  );
+
+  it("rejects observation/hand mismatch in saved decisions and imported history", async () => {
+    const current = heroDecision("middle");
+    current.decisions[0].observation.tournamentStage = "late";
+    await expect(saveSession(current)).rejects.toThrow(/Стадия/);
+    expect(await loadSession()).toBeNull();
+    const { archive } = finished("final");
+    delete archive.decisions[0].observation.tournamentStage;
+    expect(() => exportHistory([archive])).toThrow(/Стадия/);
+    const payload = {
+      format: "poker-decisions" as const,
+      version: 1 as const,
+      history: [archive],
+    };
+    await expect(importHistory(payload)).rejects.toThrow(/Стадия/);
+    expect(await allArchives()).toEqual([]);
+  });
 });
 
 describe("decision trainer persistence", () => {
