@@ -1,4 +1,4 @@
-﻿import { TablePage } from "./table/TablePage";
+﻿import { DecisionTrainer, DecisionHistory } from "./decision/DecisionTrainer";
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { useRegisterSW } from "virtual:pwa-register/react";
@@ -26,7 +26,7 @@ function App() {
   const [result, setResult] = useState<Result | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [page, setPage] = useState<"home" | "train" | "stats" | "table">(
+  const [page, setPage] = useState<"home" | "train" | "stats" | "decisions">(
     "home",
   );
   const [settings, setSettings] = useState<"general" | "trainer" | null>(null);
@@ -143,8 +143,16 @@ function App() {
   const labels = [...new Set(history.flatMap((r) => r.categories))];
   return (
     <main>
-      {page === "table" ? (
-        <TablePage onBack={() => setPage("home")} />
+      {needRefresh && (
+        <aside>
+          Доступна новая версия.{" "}
+          <button onClick={() => void updateServiceWorker(true)}>
+            Обновить
+          </button>
+        </aside>
+      )}
+      {page === "decisions" ? (
+        <DecisionTrainer onBack={() => setPage("home")} />
       ) : (
         <>
           <header className="topbar">
@@ -177,14 +185,6 @@ function App() {
               ⚙
             </button>
           </header>
-          {needRefresh && (
-            <aside>
-              Доступна новая версия.{" "}
-              <button onClick={() => void updateServiceWorker(true)}>
-                Обновить
-              </button>
-            </aside>
-          )}
           {error && (
             <p role="alert" className="error">
               {error}
@@ -199,10 +199,13 @@ function App() {
                 </span>
                 <span className="arrow">↗</span>
               </button>
-              <button className="trainer-link" onClick={() => setPage("table")}>
+              <button
+                className="trainer-link"
+                onClick={() => setPage("decisions")}
+              >
                 <span className="trainer-icon">▦</span>
                 <span className="trainer-copy">
-                  <strong>Префлоп · стол</strong>
+                  <strong>Тренажёр решений</strong>
                 </span>
                 <span className="arrow">↗</span>
               </button>
@@ -313,7 +316,9 @@ function App() {
           ) : (
             <>
               <section>
-                <h2>Ваши результаты</h2>
+                <h2>Тренажёр решений</h2>
+                <DecisionHistory />
+                <h2>Префлоп дуэль</h2>
                 <div className="metrics">
                   <div>
                     <b>{history.length}</b>

@@ -1,0 +1,433 @@
+.decision-meta,
+.decision-turn,
+.decision-links,
+.feedback-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.decision-meta {
+  font-size: 11px;
+  color: var(--muted);
+  margin: 20px 0 12px;
+}
+.decision-intro {
+  max-width: 410px;
+  margin: 70px auto 0;
+  text-align: center;
+}
+.intro-suits {
+  font-size: 32px;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+}
+.decision-intro h1 {
+  font-size: 38px;
+}
+.decision-intro p {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+.text-button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 12px 4px;
+}
+.decision-links {
+  justify-content: center;
+  margin: 15px 0;
+}
+.decision-links button,
+.decision-links .button {
+  font-size: 12px;
+}
+.decision-seats {
+  margin: 8px 0 14px;
+}
+.decision-seats summary,
+.decision-log summary,
+.decision-finish summary,
+.decision-history summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 10px 0;
+}
+.decision-seat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.decision-seat {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 10px;
+  padding: 8px;
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+}
+.decision-seat > span {
+  font-size: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.decision-seat > b {
+  font-size: 13px;
+}
+.decision-seat > small {
+  font-size: 9px;
+  color: var(--muted);
+}
+.decision-seat.you {
+  border-color: var(--accent);
+}
+.decision-seat.folded {
+  opacity: 0.55;
+}
+.decision-felt {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: 22px;
+  padding: 18px 12px 22px;
+  margin: 12px 0 20px;
+  min-height: 235px;
+}
+.decision-pot {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
+.decision-pot strong {
+  color: var(--text);
+  font-size: 17px;
+  margin-left: 5px;
+}
+.decision-board {
+  min-height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 14px 0 20px;
+}
+.empty-board {
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+.decision-cards {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+}
+.decision-card {
+  background: #f8f6ee;
+  color: #233029;
+  border-radius: 7px;
+  width: clamp(40px, 10.5vw, 58px);
+  height: clamp(59px, 15vw, 84px);
+  padding: 7px 6px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  box-shadow: 0 3px 10px #0002;
+  line-height: 1;
+}
+.decision-card b {
+  font-size: 21px;
+}
+.decision-card > span {
+  align-self: flex-end;
+  font-size: 23px;
+}
+.decision-card.red {
+  color: #b74748;
+}
+.hero-hand {
+  display: grid;
+  justify-content: center;
+  gap: 9px;
+}
+.hero-hand > span {
+  color: var(--muted);
+  font-size: 10px;
+  text-align: center;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.hero-hand .decision-card {
+  width: 58px;
+  height: 82px;
+}
+.decision-cards.small {
+  gap: 4px;
+  justify-content: flex-start;
+}
+.small .decision-card {
+  width: 25px;
+  height: 36px;
+  padding: 3px;
+  border-radius: 4px;
+}
+.small .decision-card b {
+  font-size: 11px;
+}
+.small .decision-card > span {
+  font-size: 12px;
+}
+.back-card {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--border),
+    var(--border) 3px,
+    var(--surface) 3px,
+    var(--surface) 6px
+  );
+  border: 1px solid var(--border);
+  color: var(--muted);
+  justify-content: center;
+  align-items: center;
+  font-size: 12px;
+  box-shadow: none;
+}
+.decision-turn {
+  margin: 13px 0;
+  font-size: 14px;
+}
+.decision-turn > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.decision-buttons {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+.decision-buttons button {
+  min-height: 52px;
+  padding: 10px 3px;
+  font-size: 14px;
+}
+.decision-raise {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+  margin-top: 10px;
+}
+.decision-raise label {
+  grid-column: 1/-1;
+  font-size: 12px;
+  color: var(--muted);
+  display: grid;
+  gap: 8px;
+}
+.decision-raise input {
+  width: 100%;
+  min-width: 0;
+}
+.decision-raise button {
+  font-size: 13px;
+}
+.decision-feedback {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 18px;
+  margin-top: 12px;
+}
+.feedback-heading > span {
+  font-weight: 800;
+  font-size: 12px;
+}
+.feedback-heading > small {
+  font-size: 11px;
+  color: var(--muted);
+}
+.decision-feedback h2 {
+  font-size: 18px;
+  margin: 14px 0 8px;
+}
+.decision-feedback p,
+.decision-review p {
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--muted);
+  margin: 8px 0;
+}
+.grade-good,
+.grade-reasonable {
+  --grade-color: #9ecf9b;
+}
+.grade-risky {
+  --grade-color: #d6b879;
+}
+.grade-mistake {
+  --grade-color: #e69494;
+}
+.grade-uncertain {
+  --grade-color: #a8b8cd;
+}
+.feedback-heading > span,
+.review-verdict {
+  color: var(--grade-color, var(--text));
+}
+.decision-feedback {
+  border-top: 3px solid var(--grade-color, var(--border));
+}
+.decision-log {
+  margin-top: 20px;
+}
+.decision-log p {
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 6px 0;
+}
+.decision-log p small {
+  color: var(--muted);
+}
+.decision-log .bot-reason {
+  padding: 6px 10px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 12px;
+}
+.decision-finish h2 {
+  font-size: 23px;
+  margin: 25px 0 10px;
+}
+.decision-finish > p {
+  font-size: 14px;
+}
+.decision-review {
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0;
+}
+.decision-review strong {
+  display: block;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.review-verdict {
+  display: block;
+  font-size: 11px;
+  margin-top: 5px;
+}
+.decision-sheet {
+  max-height: 87dvh;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.decision-sheet > p {
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+.decision-settings {
+  display: grid;
+  gap: 18px;
+  margin-top: 22px;
+}
+.decision-settings > label {
+  display: grid;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.decision-settings input:not([type="checkbox"]),
+.decision-settings select {
+  width: 100%;
+  min-width: 0;
+}
+.decision-settings label.decision-switch {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.decision-switch input {
+  accent-color: var(--accent);
+  width: 20px;
+  height: 20px;
+}
+.decision-history-metrics {
+  display: flex;
+  gap: 20px;
+  margin: 18px 0 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.decision-history-metrics b {
+  font-size: 23px;
+  color: var(--text);
+}
+.verdict-counts {
+  display: flex;
+  gap: 8px 14px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 18px;
+}
+.archived-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 10px 0 18px;
+}
+.archived-cards > div > span {
+  display: block;
+  font-size: 10px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.home > .trainer-link + .trainer-link:not(.stats-link) {
+  margin-top: 12px;
+}
+.decision-history details {
+  margin: 14px 0;
+}
+.decision-history .decision-links {
+  margin-top: 20px;
+}
+@media (min-width: 600px) {
+  .decision-felt {
+    padding: 25px;
+    min-height: 280px;
+  }
+  .decision-seat-grid {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+  .decision-card {
+    width: 60px;
+    height: 85px;
+  }
+  .decision-buttons {
+    max-width: 500px;
+    width: 100%;
+    margin: auto;
+  }
+  .decision-turn {
+    max-width: 500px;
+    width: 100%;
+    margin: 18px auto;
+  }
+}
+
+.decision-recent {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 14px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
