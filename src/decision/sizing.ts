@@ -1,5 +1,6 @@
 import { rank, suit, validate } from "../core";
 import type { ActionType, DecisionObservation, PublicPlayer } from "./engine";
+import { describeDecisionHand } from "./explanation";
 
 /** Every row is a hypothetical range/runout sample, never the dealt hidden hand. */
 export interface SizingSample {
@@ -21,6 +22,8 @@ export interface SizingDetails {
   heroContinuesRaise: boolean;
   heroContinuesProbe: boolean;
   effectiveTotal?: number;
+  /** Conditional share against the hypothetical hands that call this size. */
+  calledShowdownShare?: number;
 }
 export interface SizingCandidate {
   action: ActionType;
@@ -453,6 +456,13 @@ function evaluateScenario(
   details.heroContinuesRaise = raiseMass > 0 && afterRaiseMean > -ownCost;
   details.foldProbability = mean(responses.map((p) => p.fold));
   details.callProbability = mean(responses.map((p) => p.call));
+  const callMass = responses.reduce((sum, p) => sum + p.call, 0);
+  if (callMass > 0)
+    details.calledShowdownShare =
+      bank.reduce(
+        (sum, sample, i) => sum + sample.showdownShare * responses[i].call,
+        0,
+      ) / callMass;
   details.raiseProbability = raiseMass / bank.length;
   return {
     values: bank.map(
@@ -619,6 +629,87 @@ export function evaluateSizingAction(
   );
 }
 
+function aggressiveCandidate(o: DecisionObservation, c: SizingCandidate) {
+  return (
+    c.action === "raise" ||
+    (c.action === "all-in" && o.maxRaiseTo > o.currentBet)
+  );
+}
+
+function sizeFraction(o: DecisionObservation, amount: number) {
+  const { hero } = currentPlayers(o);
+  return (
+    Math.max(0, amount - o.currentBet) /
+    Math.max(1, o.pot + Math.max(0, o.currentBet - hero.streetCommitted))
+  );
+}
+
+/** The displayed amount is the full street total, matching the action input. */
+function actionText(o: DecisionObservation, c: SizingCandidate): string {
+  if (aggressiveCandidate(o, c)) {
+    const amount = c.action === "all-in" ? o.maxRaiseTo : c.total!;
+    const name =
+      c.action === "all-in"
+        ? "олл-ин до"
+        : o.currentBet === 0
+          ? "бет"
+          : "рейз до";
+    return `${name} ${chips(amount)} (около ${Math.round(sizeFraction(o, amount) * 100)}% ${o.currentBet > 0 ? "банка после колла" : "банка"})`;
+  }
+  if (c.action === "check") return "чек";
+  if (c.action === "fold") return "фолд";
+  return `${c.action === "all-in" ? "колл олл-ин" : "колл"} ${chips(o.toCall)}`;
+}
+
+/** Deliberately coarse figures: these are authored response estimates, not
+ * calibrated frequencies for the actual opponent or a solver's strategy. */
+const approximatePercent = (p: number) => Math.round(clamp(p, 0, 1) * 20) * 5;
+
+function responseExplanation(
+  o: DecisionObservation,
+  analysis: SizingAnalysis,
+  c: SizingCandidate,
+): string {
+  const d = c.details;
+  if (aggressiveCandidate(o, c)) {
+    let text = `Модель ожидает фолд соперника примерно в ${approximatePercent(d.foldProbability)}% случаев`;
+    if (d.calledShowdownShare !== undefined && d.callProbability >= 0.05)
+      text += `; против рук, отвечающих коллом, ваша доля банка на условном вскрытии — около ${approximatePercent(d.calledShowdownShare)}%`;
+    if (d.raiseProbability >= 0.075)
+      text += `; ререйз — примерно в ${approximatePercent(d.raiseProbability)}% случаев`;
+    text += ".";
+    const amount = c.action === "all-in" ? o.maxRaiseTo : c.total!;
+    if (
+      d.calledShowdownShare !== undefined &&
+      d.callProbability >= 0.05 &&
+      calledRaiseEV(o, d.calledShowdownShare, amount) < -o.pot * 0.05
+    )
+      text += " Против колла ставка здесь не окупается: ей нужны фолды.";
+    return text;
+  }
+  if (c.action === "check") {
+    if (d.probeProbability === 0)
+      return "Чек завершает эту улицу без доплаты; новая ставка в этом расчёте не нужна, чтобы сохранить шанс на банк.";
+    return `После чека модель ожидает ставку соперника примерно в ${approximatePercent(d.probeProbability)}% случаев; против такого диапазона она выбирает ${d.heroContinuesProbe ? "колл" : "фолд"}.`;
+  }
+  const share = mean(analysis.samples.map((s) => s.showdownShare));
+  const { hero, villain } = currentPlayers(o);
+  const cost = Math.min(hero.stack, o.toCall);
+  const refund = Math.max(
+    0,
+    villain.streetCommitted - hero.streetCommitted - cost,
+  );
+  const odds = cost / Math.max(1, o.pot + cost - refund);
+  return `Для колла нужна доля банка около ${Math.round(odds * 100)}%, а против предполагаемого диапазона модель даёт около ${approximatePercent(share)}% на условном вскрытии.`;
+}
+
+function explanation(...parts: (string | undefined)[]) {
+  return parts
+    .filter(Boolean)
+    .map((part) => part!.trim())
+    .join(" ");
+}
+
 export function gradeSizing(
   o: DecisionObservation,
   analysis: SizingAnalysis,
@@ -656,28 +747,37 @@ export function gradeSizing(
           Math.max(0, o.currentBet - currentPlayers(o).hero.streetCommitted),
       )
     : 0;
-  const sizeText = aggressive
-    ? `Размер до ${chips(amount!)} — около ${Math.round(fraction * 100)}% ${o.currentBet > 0 ? "банка после колла" : "банка"}. `
-    : "";
+  const context = describeDecisionHand(o);
+  const actualText = actionText(o, actual);
+  const bestText = actionText(o, best);
+  const chosen = aggressive ? `Ваш выбор — ${actualText}.` : undefined;
+  const sameAction =
+    actual.action === best.action && actual.total === best.total;
+  const preferred = `В базовом расчёте модель предпочитает ${bestText}.`;
   const protection =
     analysis.protection && aggressive && fraction <= 0.5
-      ? "Небольшая ставка может лишить оверкарты части их шансов и иногда собрать оплату с более слабых рук; эффект зависит от того, какие руки ответят. "
-      : "";
+      ? "Небольшая ставка также может лишить часть более слабых рук бесплатного улучшения."
+      : undefined;
   if (analysis.sampleCount < 80)
     return {
       verdict: "uncertain",
       title: "Недостаточно данных для размера",
-      reason:
-        sizeText +
-        "Для уверенного сравнения размеров выборка слишком мала; это не доказательство ошибки.",
+      reason: explanation(
+        context,
+        chosen,
+        preferred,
+        "Выборка слишком мала для уверенного сравнения; это не доказательство ошибки.",
+      ),
     };
   if (!actual.trusted)
     return {
       verdict: "uncertain",
       title: "Слишком далеко за проверенной моделью размеров",
-      reason:
-        sizeText +
-        "Эффективное повышение превышает два банка после колла. Ответы на такой глубокий овербет здесь лишь экстраполированы, поэтому модель не может надёжно одобрить или осудить размер.",
+      reason: explanation(
+        context,
+        chosen,
+        "Эффективное повышение превышает два банка после колла. Для такого овербета ответы соперника лишь экстраполированы: надёжного вывода о размере нет.",
+      ),
     };
   if (
     (action === "call" || (action === "all-in" && !aggressive)) &&
@@ -688,8 +788,12 @@ export function gradeSizing(
     return {
       verdict: "mistake",
       title: "Слишком дорогой колл",
-      reason:
-        "На ривере оценка колла существенно отрицательна при всех проверенных вариантах ответов и с учётом шума. Против предполагаемого диапазона лучше фолд; это не утверждение о реальных скрытых картах.",
+      reason: explanation(
+        context,
+        `Модель предпочитает фолд; ваш выбор — ${actualText}.`,
+        responseExplanation(o, analysis, actual),
+        "Против этого предполагаемого диапазона колл существенно хуже фолда даже с учётом шума; реальные скрытые карты при оценке не используются.",
+      ),
     };
   if (
     loss <= tolerance &&
@@ -698,28 +802,37 @@ export function gradeSizing(
     return {
       verdict: "uncertain",
       title: "Ответ соперника меняет выбор размера",
-      reason:
-        sizeText +
-        protection +
-        "При других правдоподобных ответах заметно лучше оказывается другой размер или действие. Одного выигрыша в базовой модели недостаточно, чтобы уверенно одобрить этот выбор.",
+      reason: explanation(
+        context,
+        chosen,
+        preferred,
+        responseExplanation(o, analysis, best),
+        "При более узких или широких ответах выбор меняется, поэтому уверенной рекомендации нет.",
+      ),
     };
   if (loss <= tolerance)
     return {
       verdict: "reasonable",
       title: aggressive ? "Допустимый размер ставки" : "Допустимое действие",
-      reason:
-        sizeText +
-        protection +
-        "В ограниченной модели действие близко к лучшим вариантам с учётом шума. Это не доказательство оптимального размера на всех следующих улицах.",
+      reason: explanation(
+        context,
+        `В ограниченной модели ${actualText} допустим${sameAction ? "" : `; близкий вариант в базовом расчёте — ${bestText}`}.`,
+        responseExplanation(o, analysis, actual),
+        protection,
+        "Разница с лучшими вариантами укладывается в принятый допуск модели; следующие улицы здесь не решены.",
+      ),
     };
   if (!robust)
     return {
       verdict: "uncertain",
       title: "Размер зависит от ответов соперника",
-      reason:
-        sizeText +
-        protection +
-        "Преимущество другого размера меняется при более узких или широких ответах соперника либо сравнимо с погрешностью; уверенной ошибки здесь нет.",
+      reason: explanation(
+        context,
+        chosen,
+        preferred,
+        responseExplanation(o, analysis, best),
+        "Преимущество меняется при более узких или широких ответах соперника либо сравнимо с погрешностью; уверенной ошибки здесь нет.",
+      ),
     };
   const bestAggressive =
     best.action === "raise" ||
@@ -731,22 +844,24 @@ export function gradeSizing(
       title: more
         ? "В этой модели можно поставить больше"
         : "В этой модели лучше меньший размер",
-      reason:
-        sizeText +
-        `Сравнение фолдов, коллов и ререйзов устойчиво предпочитает размер до ${chips(best.total)} на этой улице. Предположения о диапазонах и следующих улицах могут изменить результат; это не точный GTO-сайзинг.`,
+      reason: explanation(
+        context,
+        chosen,
+        preferred,
+        responseExplanation(o, analysis, best),
+        "Преимущество сохраняется при проверенных вариантах ответов, но дальнейшие улицы могут изменить вывод.",
+      ),
     };
   }
   return {
     verdict: "risky",
-    title: aggressive
-      ? "Ставка спорна против этого диапазона"
-      : "Есть более подходящее действие",
-    reason:
-      sizeText +
-      (aggressive
-        ? "В ограниченной модели чек или колл сохраняет больше ожидаемых фишек, чем эта ставка. "
-        : "Ограниченная модель предпочитает другой способ продолжить. ") +
-      "Это сравнение авторских ответов на текущей улице, а не решение всей раздачи.",
+    title: `Модель предпочитает ${bestText.replace(/ \(около.*$/, "")}`,
+    reason: explanation(
+      context,
+      `Ваш выбор — ${actualText}. Модель предпочитает ${bestText}.`,
+      responseExplanation(o, analysis, best),
+      "Преимущество сохраняется при проверенных ответах; это разбор текущей улицы, а не всей раздачи.",
+    ),
   };
 }
 

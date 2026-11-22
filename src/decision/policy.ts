@@ -9,6 +9,7 @@ import type {
 } from "./engine";
 import { analyzeSizing, chooseSizingAction, gradeSizing } from "./sizing";
 import type { SizingAnalysis, SizingChoice, SizingSample } from "./sizing";
+import { describeDecisionHand } from "./explanation";
 
 /** An authored teaching policy, NOT an equilibrium solver or a full-game EV predictor.
  * The only input boundary is DecisionObservation; no actual opponent cards or
@@ -1042,6 +1043,7 @@ export function gradeDecision(
       verdict: "uncertain",
       title: "Нужен разбор отдельных банков",
       reason:
+        (o.street !== "preflop" ? describeDecisionHand(o) + " " : "") +
         "Здесь есть олл-ин и разные доступные слои банка. Цена колла учитывает ваш доступ к банкам, но общая оценка equity не заменяет отдельный стратегический разбор каждого слоя; уверенно оценивать действие нельзя.",
     };
   const actor = o.players.find((player) => player.id === o.actorId)!;
@@ -1075,7 +1077,7 @@ export function gradeDecision(
     return {
       verdict: "uncertain",
       title: "Недостаточно данных для уверенной оценки",
-      reason: `${analysis.sizing?.unsupportedReason ?? "Для этой ситуации пока нет сравнения размеров ставок и ответов соперников."} Общая сила комбинации сама по себе не определяет качество конкретной ставки. Это не доказывает ошибку выбранного действия.`,
+      reason: `${describeDecisionHand(o)} ${analysis.sizing?.unsupportedReason ?? "Для этой ситуации пока нет сравнения размеров ставок и ответов соперников."} Поэтому конкретное действие и размер здесь не определены надёжно; сила комбинации сама по себе не доказывает ошибку.`,
     };
   }
   // A clear shortfall in the chip-price test remains a mistake even late in a
